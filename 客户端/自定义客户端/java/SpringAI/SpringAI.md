@@ -4,24 +4,33 @@
 
 ```
 <dependencies>
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-mcp-client-spring-boot-starter</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.springframework.ai</groupId>
-        <artifactId>spring-ai-ollama-spring-boot-starter</artifactId>
-    </dependency>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-ollama</artifactId>
+        </dependency>
 
-    <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-starter-test</artifactId>
-        <scope>test</scope>
-    </dependency>
+
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-client</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+
+
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+        </dependency>
+
 </dependencies>
 
 <dependencyManagement>
@@ -45,16 +54,20 @@
 **properties**
 
 ```
+# ollama
 spring.ai.ollama.base-url=http://localhost:11434
 spring.ai.ollama.chat.model=qwen2.5:latest
 
+
 # MCP Client Configuration
 spring.ai.mcp.client.enabled=true
+# 启用工具回调功能
 spring.ai.mcp.client.toolcallback.enabled=true
 spring.ai.mcp.client.name=mcp-client
 spring.ai.mcp.client.version=1.0.0
 spring.ai.mcp.client.type=SYNC
 spring.ai.mcp.client.request-timeout=30s
+# 配置MCP Server相关服务信息
 spring.ai.mcp.client.stdio.servers-configuration=classpath:/mcp-servers-config.json
 
 debug=true
@@ -88,21 +101,44 @@ windows：
         "npx",
         "-y",
         "@modelcontextprotocol/server-filesystem",
-        "D:\\",
         "C:\\Users\\redfish\\Desktop"
       ]
     }
   }
 }
+
 ```
 
 
 
 
 
-# 启动类
 
-## 代码
+
+# 代码
+
+## 关键类
+
+**公共client**
+
+```
+@Component
+public class ChatClients {
+
+    public static ChatClient DEFAULT_CHAT_CLIENT;
+
+    public ChatClients(ChatClient.Builder builder,
+                       SyncMcpToolCallbackProvider syncMcpToolCallbackProvider
+                       ) {
+        DEFAULT_CHAT_CLIENT = builder
+                .defaultToolCallbacks(syncMcpToolCallbackProvider.getToolCallbacks())
+                .build();
+    }
+
+}
+```
+
+
 
 ```
 import jakarta.annotation.Resource;
@@ -130,16 +166,17 @@ public class Application {
 
         @Resource
         private SyncMcpToolCallbackProvider toolCallbackProvider;
-
-        @GetMapping("/chat")
-        public String call(@RequestParam(name = "input") String input) {
-            ChatClient chatClient = ChatClient.builder(ollamaChatModel)
-                    .defaultToolCallbacks(toolCallbackProvider.getToolCallbacks())
-                    .build();
-            return chatClient.prompt(input).call().content();
-        }
-    }
+        
+        
+          @PostMapping("/mcp/client/chat")
+            public String call(@RequestBody JSONObject reqBody) {
+                String input = reqBody.getString("input");
+                return ChatClients.DEFAULT_CHAT_CLIENT.prompt(input).call().content();
+            }
+            }
 }
+
+
 ```
 
 
@@ -167,7 +204,12 @@ windows：C:\Users\redfish\AppData\Local\npm-cache
 # 测试用例
 
 ```localhost:8080/chat?input=帮我创建一个文件夹 mcp
-http://localhost:8080/chat?input=帮我创建一个文件夹 mcp
+创建文件夹
+{
+	"input":"我创建一个文件夹C:\\Users\\redfish\\Desktop\\123456"
+}
+
+待验证
 http://localhost:8080/chat?input=帮我在文件夹mcp下创建一个 test.txt 文件，并写入 hello mcp！
 http://localhost:8080/chat?input=帮我将 mcp/test.txt 中 hello mcp 改为 Hello MCP！
 ```
