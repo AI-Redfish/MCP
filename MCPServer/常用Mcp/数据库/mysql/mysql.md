@@ -18,3 +18,12 @@
 			}
 ```
 
+
+
+
+
+# 其他MCP
+
+**支持多mysql连接的mcp-server**
+
+https://modelscope.cn/mcp/servers/@FreePeak/db-mcp-server
