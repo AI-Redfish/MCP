@@ -1,6 +1,8 @@
-# 浏览器自动化
+# **microsoft/playwright-mcp**
 
-**microsoft/playwright-mcp**
+浏览器自动化操作。
+
+https://smithery.ai/servers/microsoft/playwright-mcp
 
 ```
 "playwright-mcp": {
@@ -16,4 +18,6 @@
     }
   }
 ```
+
+
 
