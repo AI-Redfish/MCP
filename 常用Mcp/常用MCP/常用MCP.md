@@ -49,9 +49,57 @@ https://smithery.ai/servers/microsoft/playwright-mcp
 
 
 
+如果使用失败，可以尝试关闭重启。
+关闭浏览器，node服务，cursor(或其他agent)，按照如下步骤重启。
+
+浏览器-》node服务-》cursor。
 
 
 
+# Fetch MCP
+
+
+
+## 使用步骤
+
+- 抓网页：输入 URL，Fetch 去把内容弄回来
+- 转格式：把乱七八糟的 HTML 转成干净的 Markdown（还能支持其他格式，比如纯文本）
+- 喂 LLM：把抓来的内容通过 MCP 接口丢给智能体处理
+
+Github: https://github.com/modelcontextprotocol/servers/blob/main/src/fetch/README.md
+
+
+
+**使用**
+
+```
+
+windows
+"fetch": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "uvx",
+        "mcp-server-fetch"
+      ]
+    }
+    
+    
+  
+```
+
+
+
+## 使用案例
+
+**抓取网页并分析**
+
+```
+use MCP：fetch
+
+获取: https://github.com/modelcontextprotocol/servers/ 
+分析里面的内容。
+```
 
 
 
@@ -93,6 +141,14 @@ https://smithery.ai/servers/upstash/context7-mcp
 			  "timeout": 60
 			}
 ```
+
+
+
+## 使用场景
+
+1，使用MysqlMCP通过对话获取数据，并保存到file/db等地方，然后借助UI组件生成对应的图标。
+
+实现基于对话灵活查询任意数据的图标。
 
 
 
