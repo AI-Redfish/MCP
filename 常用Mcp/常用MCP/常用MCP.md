@@ -21,7 +21,7 @@ https://smithery.ai/servers/microsoft/playwright-mcp
 
 
 
-<<<<<<< HEAD
+
 # Chrome Developer Tools
 
 ## **对别Playwright**
@@ -45,7 +45,6 @@ https://smithery.ai/servers/microsoft/playwright-mcp
 1. 你要做 E2E 测试、回归、批量操作网页：选 Playwright MCP（推荐）。
 2. 你要做性能/内存/网络/控制台深度排查：选 Chrome DevTools MCP（推荐）。
 3. 团队最佳实践：**两者都用**——Playwright 负责复现和回归，DevTools 负责根因分析。
-=======
 
 
 # BrowserTools MCP
@@ -63,8 +62,8 @@ https://smithery.ai/servers/microsoft/playwright-mcp
 
 
 
-<<<<<<< HEAD
-=======
+
+
 ## 使用步骤
 
 1，下载仓库：https://github.com/AgentDeskAI/browser-tools-mcp
