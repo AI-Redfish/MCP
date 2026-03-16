@@ -8,6 +8,12 @@ https://smithery.ai/servers
 
 
 
+**Github**
+
+https://github.com/modelcontextprotocol/servers/
+
+
+
 **MCP-server集合**
 
 https://mcp.so/zh
