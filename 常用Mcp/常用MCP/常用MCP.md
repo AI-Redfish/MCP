@@ -1,5 +1,33 @@
 
 
+
+
+# **microsoft/playwright-mcp-待深入研究**
+
+浏览器自动化操作。
+
+https://github.com/microsoft/playwright-mcp
+
+```
+#windows
+"playwrightMCP": {
+  "command": "cmd",
+  "args": [
+    "/c",
+    "npx",
+    "@playwright/mcp@latest"
+  ]
+}
+```
+
+
+
+
+
+
+
+
+
 # Sequential Thinking + Software Planning Tool
 
 这两个 MCP 常用来解决“复杂问题不好下手”的情况：一个帮你**按步骤推演**，一个帮你**把需求拆成可执行的研发计划**。
@@ -93,28 +121,6 @@ npm run build
 ```
 
 
-
-
-# **microsoft/playwright-mcp**
-
-浏览器自动化操作。
-
-https://smithery.ai/servers/microsoft/playwright-mcp
-
-```
-"playwright-mcp": {
-      "command": "cmd",
-      "args": [
-        "/c",
-        "npx",
-        "-y",
-        "@smithery/cli@latest",
-        "run",
-        "microsoft/playwright-mcp"
-      ]
-    }
-  }
-```
 
 
 
