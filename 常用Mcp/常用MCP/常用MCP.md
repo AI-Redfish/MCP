@@ -1,3 +1,100 @@
+
+
+# Sequential Thinking + Software Planning Tool
+
+这两个 MCP 常用来解决“复杂问题不好下手”的情况：一个帮你**按步骤推演**，一个帮你**把需求拆成可执行的研发计划**。
+
+
+
+## **Sequential Thinking**
+
+**战略家/架构师**。负责分析需求、评估风险、制定策略、在遇到错误时回退并重新规划。它不直接写代码，而是生成“行动计划”。
+
+如同资深技术主管 (Tech Lead)。
+
+
+
+**安装**
+
+
+```
+// Windows
+    "sequential-thinking": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    }
+```
+
+
+
+## **Software Planning Tool**
+
+**项目经理/看板**。负责将战略家的计划转化为具体的 Task 列表，追踪每个任务的状态 (Todo/Doing/Done)，记录依赖关系，防止任务遗漏。
+
+项目经理 (PM) + Jira/Trello
+
+
+
+**安装**
+
+
+```
+git clone https://github.com/NightTrek/Software-planning-mcp.git
+cd Software-planning-mcp
+npm install
+npm run build
+
+// Windows
+"software-planning": {
+  "command": "cmd",
+  "args": [
+    "/c",
+    "node",
+    "D:/develop/Agent/mcp/Software-planning-mcp/build/index.js"
+  ],
+  "disabled": false,
+  "env": {}
+}
+```
+
+
+
+## 工作流程
+
+1. **输入**：用户提出复杂需求（如“开发一个带支付功能的电商后台”）。
+2. 思考 (Sequential Thinking)
+   - AI 调用 `sequential_thinking` 工具。
+   - 分解问题：数据库设计 -> API 定义 -> 前端页面 -> 支付集成 -> 测试。
+   - **动态反思**：AI 思考：“直接做支付可能太复杂，是否需要先模拟支付接口？”，“数据库选型用 MySQL 还是 Mongo？根据需求看关系型更合适。”
+   - 输出：一份经过深思熟虑的**高阶路线图 (Roadmap)**。
+3. 规划 (Planning Tool)
+   - AI 调用 `create_plan` 或 `add_tasks`。
+   - 将路线图转化为具体的、可执行的 Task 列表（例如：`Task-001: 设计 User 表`, `Task-002: 实现登录 API`）。
+   - 设定依赖：`Task-002` 依赖 `Task-001`。
+4. 执行 (Coding Agent)
+   - AI 读取 Planning Tool 中的第一个 "Todo" 任务。
+   - 编写代码、运行测试。
+5. 反馈与更新
+   - 如果测试失败，AI 再次触发 **Sequential Thinking** 分析错误原因。
+   - 思考后，调用 Planning Tool **更新任务状态**（标记为 Failed，或插入新的 Debug 任务）。
+   - 如果任务完成，标记为 Done，自动进入下一个任务。
+
+
+
+**案例**
+
+```
+我要做一个‘个人记账 Web 应用’。前端用 React + Tailwind，后端用 Node.js + Express，数据库用 SQLite。需要支持分类、日期筛选和简单的图表展示。请帮我规划并生成代码。
+```
+
+
+
+
 # **microsoft/playwright-mcp**
 
 浏览器自动化操作。
@@ -124,8 +221,6 @@ use MCP：fetch
 获取: https://github.com/modelcontextprotocol/servers/ 
 分析里面的内容。
 ```
-
->>>>>>> 1912989efab4a5ca416a1f057c2e3f5c3a6134ca
 
 
 # Context7
