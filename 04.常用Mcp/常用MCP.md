@@ -1,7 +1,5 @@
 
 
-
-
 # **microsoft/playwright-mcp-待深入研究**
 
 浏览器自动化操作。
@@ -24,7 +22,19 @@ https://github.com/microsoft/playwright-mcp
 
 
 
+# Puppeteer
 
+相比playwright，Puppeteer：历史上更“贴近 CDP”，很多高级能力直接就是 CDP 的封装/调用。
+
+
+
+**能用 CDP 做什么（常见能力）**
+
+- 页面与 DOM：查 DOM、执行 JS、改样式、读写 localStorage/cookie
+- 网络：监听/拦截请求、改请求头、抓响应内容、模拟离线/限速
+- 性能与诊断：CPU profile、性能指标、console log、覆盖率
+- 调试：断点、调用栈、source map、异常捕获
+- 设备模拟：viewport、UA、触控、地理位置
 
 
 
