@@ -199,25 +199,41 @@ use MCP：fetch
 
 # mysql
 
+**claude安装**
+
 ```
-	windows环境
-	
-	"mysql": {
-			  "command": "npx",
-			  "args": [
-				"-y",
-				"@bytebase/dbhub",
-				"--transport",
-				"stdio",
-				"--dsn",
-				"mysql://root:root@localhost:3306/redfish",
-				"--allow-insert",
-				"--allow-update"
-			  ],
-			  "disabled": false,
-			  "timeout": 60
-			}
+# windows
+claude mcp add mysql --scope local -- npx -y @bytebase/dbhub --transport stdio --dsn "mysql://root:Sinomis+12.@124.220.31.96:3306/basic_platform_ops" --allow-insert --allow-update
 ```
+
+
+
+
+
+**cursor安装**
+
+```
+windows环境
+
+
+"mysql": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "@bytebase/dbhub",
+            "--transport",
+            "stdio",
+            "--dsn",
+            "mysql://root:root@localhost:3306/redfish",
+            "--allow-insert",
+            "--allow-update"
+          ],
+          "disabled": false,
+          "timeout": 60
+        }
+```
+
+
 
 
 
