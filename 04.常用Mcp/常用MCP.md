@@ -92,7 +92,7 @@ https://github.com/microsoft/playwright-mcp
 
 
 
-# Chrome Developer Tools
+# chrome-devtools-mcp
 
 ## **对别Playwright**
 
@@ -115,6 +115,46 @@ https://github.com/microsoft/playwright-mcp
 1. 你要做 E2E 测试、回归、批量操作网页：选 Playwright MCP（推荐）。
 2. 你要做性能/内存/网络/控制台深度排查：选 Chrome DevTools MCP（推荐）。
 3. 团队最佳实践：**两者都用**——Playwright 负责复现和回归，DevTools 负责根因分析。
+
+
+
+## 使用步骤
+
+**开启浏览器调试**
+
+访问 `chrome://inspect/#remote-debugging` 启用远程调试
+
+
+
+
+
+**诊断网络和控制台错误**
+
+授权Agent分析网络请求以发现CORS问题或检查控制台日志，以了解功能无法按预期工作的原因。
+
+```
+A few images on localhost:8080 are not loading. What's happening?
+
+Why does submitting the form fail after entering an email address?
+```
+
+
+
+**调试实时样式和布局问题**
+
+```
+The page on localhost:8080 looks strange and off. Check what's happening there.
+```
+
+
+
+**性能优化**
+
+```
+Localhost:8080 is loading slowly. Make it load faster.
+```
+
+
 
 
 # BrowserTools MCP
