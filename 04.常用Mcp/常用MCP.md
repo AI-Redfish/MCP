@@ -41,9 +41,60 @@ https://smithery.ai/servers/upstash/context7-mcp
 
 
 
+```
+# claude-windows-cmd安装
+claude mcp add context7 --scope project -- cmd /c npx -y @upstash/context7-mcp
+```
 
 
 
+
+
+# mysql
+
+**claude安装**
+
+```
+# windows
+claude mcp add mysql --scope project -- npx -y @bytebase/dbhub --transport stdio --dsn "mysql://root:Sinomis+12.@124.220.31.96:3306/basic_platform_ops" --allow-insert --allow-update
+```
+
+
+
+
+
+**cursor安装**
+
+```
+windows环境
+
+
+"mysql": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "@bytebase/dbhub",
+            "--transport",
+            "stdio",
+            "--dsn",
+            "mysql://root:root@localhost:3306/redfish",
+            "--allow-insert",
+            "--allow-update"
+          ],
+          "disabled": false,
+          "timeout": 60
+        }
+```
+
+
+
+
+
+## 使用场景
+
+1，使用MysqlMCP通过对话获取数据，并保存到file/db等地方，然后借助UI组件生成对应的图标。
+
+实现基于对话灵活查询任意数据的图标。
 
 
 
@@ -237,51 +288,7 @@ use MCP：fetch
 
 
 
-# mysql
 
-**claude安装**
-
-```
-# windows
-claude mcp add mysql --scope local -- npx -y @bytebase/dbhub --transport stdio --dsn "mysql://root:Sinomis+12.@124.220.31.96:3306/basic_platform_ops" --allow-insert --allow-update
-```
-
-
-
-
-
-**cursor安装**
-
-```
-windows环境
-
-
-"mysql": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@bytebase/dbhub",
-            "--transport",
-            "stdio",
-            "--dsn",
-            "mysql://root:root@localhost:3306/redfish",
-            "--allow-insert",
-            "--allow-update"
-          ],
-          "disabled": false,
-          "timeout": 60
-        }
-```
-
-
-
-
-
-## 使用场景
-
-1，使用MysqlMCP通过对话获取数据，并保存到file/db等地方，然后借助UI组件生成对应的图标。
-
-实现基于对话灵活查询任意数据的图标。
 
 
 
