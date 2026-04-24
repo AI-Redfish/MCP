@@ -69,6 +69,7 @@ claude mcp add mysql --scope project -- npx -y @bytebase/dbhub --transport stdio
 windows环境
 
 
+# 链接多个数据库
 "mysql": {
           "command": "npx",
           "args": [
@@ -84,6 +85,8 @@ windows环境
           "disabled": false,
           "timeout": 60
         }
+        
+# 支持链接多个数据库，具体配置让AI补充下就行。
 ```
 
 
