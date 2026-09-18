@@ -1,0 +1,3 @@
+# ===== Environment config (never commit) =====
+# Matches .env files or folders at ANY level
+.env
