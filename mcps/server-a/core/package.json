@@ -1,0 +1,14 @@
+{
+  "name": "@ai-redfish/server-a-core",
+  "version": "0.1.0",
+  "description": "server-a 核心逻辑：纯函数与工具元数据，不感知任何传输方式",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}

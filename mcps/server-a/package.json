@@ -1,7 +1,25 @@
 {
-  "name": "mcp-server-a",
+  "name": "ai-redfish-mcp-server-a",
   "version": "0.1.0",
-  "description": "示例 MCP 子服务：echo / now 两个演示工具",
-  "main": "index.js",
-  "license": "MIT"
+  "private": true,
+  "description": "server-a 工作区：core（核心逻辑）+ cli（CLI 适配器）+ mcp（MCP 适配器），一个工具，多种提供方式",
+  "license": "MIT",
+  "workspaces": [
+    "core",
+    "cli",
+    "mcp"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "start:mcp": "node mcp/dist/index.js",
+    "start:cli": "node cli/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }

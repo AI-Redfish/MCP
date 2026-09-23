@@ -1,0 +1,7 @@
+packages:
+  - 'core'
+  - 'cli'
+  - 'mcp'
+
+# 允许 pnpm 把本地 workspace 包按版本号自动链接（npm 走 package.json 的 workspaces 字段）
+linkWorkspacePackages: true

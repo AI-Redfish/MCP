@@ -1,0 +1,9 @@
+{
+  // 工程引用入口：`tsc -b` 会按 core -> cli/mcp 的依赖顺序构建
+  "files": [],
+  "references": [
+    { "path": "core" },
+    { "path": "cli" },
+    { "path": "mcp" }
+  ]
+}
