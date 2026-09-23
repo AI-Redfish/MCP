@@ -1,8 +1,8 @@
 {
-  "name": "ai-redfish-mcp-server-a",
+  "name": "ai-redfish-tool-server-a",
   "version": "0.1.0",
   "private": true,
-  "description": "server-a 工作区：core（核心逻辑）+ cli（CLI 适配器）+ mcp（MCP 适配器），一个工具，多种提供方式",
+  "description": "server-a 工具工作区：core（核心逻辑）+ cli / mcp 等适配器，一个工具，多种提供方式",
   "license": "MIT",
   "workspaces": [
     "core",

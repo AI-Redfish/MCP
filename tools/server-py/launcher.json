@@ -1,0 +1,5 @@
+{
+  "description": "server-py：Python 标准库实现的示例（core + cli + mcp），演示启动器可拉起任意语言的子服务",
+  "command": "python",
+  "args": ["mcp_server.py"]
+}

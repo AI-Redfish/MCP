@@ -1,15 +1,15 @@
 {
-  "name": "ai-redfish-mcp-collection",
+  "name": "ai-redfish-tool-collection",
   "version": "0.1.0",
-  "description": "MCP 服务器集合：仓库根目录作为启动器（Launcher），根据参数动态加载 mcps/ 目录下的各个 MCP 子服务（每个子服务为 core + cli + mcp 三包工作区）",
+  "description": "工具集合：每个工具都可以以多种方式提供（MCP、CLI，后续可扩展更多方式）。仓库根目录作为启动器（Launcher），根据参数动态加载 tools/ 目录下的各个工具",
   "license": "MIT",
   "bin": {
-    "mcp-collection": "bin/mcp-launcher.js"
+    "tool-collection": "bin/tool-launcher.js"
   },
   "scripts": {
-    "start": "node bin/mcp-launcher.js",
-    "list": "node bin/mcp-launcher.js list",
-    "build": "node bin/mcp-launcher.js build"
+    "start": "node bin/tool-launcher.js",
+    "list": "node bin/tool-launcher.js list",
+    "build": "node bin/tool-launcher.js build"
   },
   "engines": {
     "node": ">=18"
