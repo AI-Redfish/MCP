@@ -1,0 +1,7 @@
+{
+  "name": "mcp-server-a",
+  "version": "0.1.0",
+  "description": "示例 MCP 子服务：echo / now 两个演示工具",
+  "main": "index.js",
+  "license": "MIT"
+}
