@@ -1,0 +1,18 @@
+{
+  "name": "@ai-redfish/jev-browser-core",
+  "version": "0.1.0",
+  "description": "jev-browser 核心逻辑：配置、安全策略、任务状态机、执行引擎、Jev 判断与可选规划器（通过端口注入浏览器，不感知传输方式）",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0",
+    "playwright": "^1.63.0"
+  }
+}

@@ -1,0 +1,13 @@
+# 依赖与构建产物（可再生）
+node_modules/
+dist/
+test-dist/
+*.tsbuildinfo
+
+# 运行时数据：任务库、artifact、profile、锁（绝不入库）
+data/
+profiles/
+
+# 本地秘密与覆盖配置
+.env
+*.local.json

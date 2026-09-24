@@ -1,0 +1,28 @@
+{
+  "name": "ai-redfish-tool-jev-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "jev-browser 工作区：Playwright + Jev 浏览器控制（core + cli/mcp/api 适配器，A/B 共用执行引擎）",
+  "license": "MIT",
+  "workspaces": [
+    "core",
+    "cli",
+    "mcp",
+    "api"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "test": "tsc -b core/test && node --test core/test-dist",
+    "start:mcp": "node mcp/dist/index.js",
+    "start:cli": "node cli/dist/index.js",
+    "start:api": "node api/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.4"
+  }
+}

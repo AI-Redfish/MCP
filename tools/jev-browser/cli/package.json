@@ -1,0 +1,20 @@
+{
+  "name": "@ai-redfish/jev-browser-cli",
+  "version": "0.1.0",
+  "description": "jev-browser 的 CLI 适配器：以命令行方式调用 core（doctor/connect/pages/execute/run/task/artifact 等）",
+  "license": "MIT",
+  "bin": {
+    "jev-browser-cli": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ai-redfish/jev-browser-core": "0.1.0"
+  }
+}

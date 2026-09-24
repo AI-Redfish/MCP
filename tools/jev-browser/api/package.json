@@ -1,0 +1,17 @@
+{
+  "name": "@ai-redfish/jev-browser-api",
+  "version": "0.1.0",
+  "description": "jev-browser 的 HTTP API 适配器：本地长驻宿主（仅 loopback + token），session/task/artifact 路由",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ai-redfish/jev-browser-core": "0.1.0"
+  }
+}

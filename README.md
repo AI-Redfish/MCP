@@ -217,6 +217,14 @@ npx github:AI-Redfish/Tool server-py
 | `server-a` | TypeScript | core + cli + mcp 三包工作区示例 | `echo`、`now` | `server-a-cli`（可全局安装） |
 | `server-py` | Python（纯标准库） | 多语言演示，与 server-a 同构分层 | `echo`、`now` | `python tools/server-py/cli.py` |
 
+## 规划中的工具
+
+- **jev-browser**：Playwright + Jev 浏览器控制，拟支持 `execute` / `run` 两种模式，以及 MCP、CLI、HTTP API 入口；默认授权接管日常 Chrome、有头运行。
+  详见 [方案总览](tools/jev-browser/README.md)、[技术设计](tools/jev-browser/DESIGN.md)、[开发计划](tools/jev-browser/DEVELOPMENT_PLAN.md)。
+- **jev-desktop**：LLM 规划 + Jev 判断的 Windows 桌面软件控制（Python 实现），UIA 语义树 + 截图/OCR/视觉三档可降级观察，`execute` / `run` 双模式共用执行引擎，MCP 与 CLI 入口。
+  详见 [方案总览](tools/jev-desktop/README.md)、[技术设计](tools/jev-desktop/DESIGN.md)、[开发计划](tools/jev-desktop/DEVELOPMENT_PLAN.md)、[研究记录](tools/jev-desktop/RESEARCH.md)。
+- 两个工具当前仅完成设计与开发计划，**尚不可运行，未加入可用工具列表**。
+
 ## 如何新增一个工具
 
 1. 在 `tools/` 下新建子目录（目录名即工具名，只允许字母、数字、`.`、`_`、`-`）：
