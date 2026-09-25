@@ -18,6 +18,8 @@ export interface PlannerInput {
 
 export interface PlannerProvider {
   plan(input: PlannerInput): Promise<FlowStep[]>;
+  /** 已消耗的请求与 token（DESIGN §6.4 预算/DESIGN §11 可观测）。 */
+  usage?(): { requests: number; inputTokens: number; outputTokens: number };
 }
 
 const STEP_LIMIT = 30;
@@ -29,7 +31,7 @@ function systemPrompt(): string {
     '规则：',
     '1. action.action 只能是 navigate|click|fill|press|select|scroll|wait|screenshot。',
     '2. LocatorSpec.by 只能是 role|label|testId|text|css；优先 role+name。',
-    '3. navigate/click/fill 等 action 必须带非空 expect 后置条件。',
+    '3. navigate/click/fill/press/select 必须带非空 expect 后置条件；screenshot/wait/scroll 可省略。',
     '4. branch 只允许一层（then 内不得再有 branch/forEach）；forEach.maxItems 不得超过 30。',
     `5. 总步骤数不得超过 ${STEP_LIMIT}；优先 extract+assert 组合而不是猜测。`,
     '6. 不要发明 values 中不存在的键；敏感值用 valuesRef 引用。',
@@ -48,6 +50,8 @@ function userPrompt(input: PlannerInput): string {
 }
 
 const ACTION_NAMES = new Set(['navigate', 'click', 'fill', 'press', 'select', 'scroll', 'wait', 'screenshot']);
+/** 导航与写操作必须提供后置条件；纯观察动作可由返回证据验证（DESIGN §8.1）。 */
+export const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'press', 'select']);
 const LOCATOR_BY = new Set(['role', 'label', 'testId', 'text', 'css']);
 const EXPECT_KINDS = new Set(['url_contains', 'text_present', 'visible', 'hidden', 'count_gte', 'download_completed', 'var_equals']);
 
@@ -84,7 +88,12 @@ export function validatePlannedSteps(raw: unknown, depth = 0): FlowStep[] {
         if (!ACTION_NAMES.has(action)) throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}].action 非法: ${action}`);
         if (step.target !== undefined) validateLocator(step.target, `steps[${idx}].target`);
         const expect = validateExpects(step.expect, `steps[${idx}].expect`);
-        if (expect.length === 0) throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] action 缺少 expect 后置条件`);
+        if (WRITE_ACTIONS.has(action) && expect.length === 0) {
+          throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] 写操作 ${action} 缺少 expect 后置条件`);
+        }
+        if (action === 'navigate' && step.value === undefined && step.valuesRef === undefined) {
+          throw err('PLANNER_INVALID_OUTPUT', `steps[${idx}] navigate 需要 value 或 valuesRef`);
+        }
         const out: ActionStep = {
           id,
           kind: 'action',
@@ -141,8 +150,16 @@ interface ChatMessage {
   content: string;
 }
 
+interface ChatUsage {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 /** openai-compatible Provider：/chat/completions + JSON 输出 + 一次受控修复请求（DESIGN §7）。 */
 export class OpenAICompatibleProvider implements PlannerProvider {
+  private readonly stats: ChatUsage = { requests: 0, inputTokens: 0, outputTokens: 0 };
+
   constructor(
     private readonly opts: {
       cfg: PlannerConfig;
@@ -152,11 +169,16 @@ export class OpenAICompatibleProvider implements PlannerProvider {
     },
   ) {}
 
+  usage(): ChatUsage {
+    return { ...this.stats };
+  }
+
   private async chat(messages: ChatMessage[], jsonMode: boolean): Promise<string> {
     const { cfg, apiKey, fetchImpl = fetch } = this.opts;
     if (!apiKey) throw err('PLANNER_NOT_CONFIGURED', `缺少规划模型 key（${cfg.apiKeyEnv}）`);
     const body: Record<string, unknown> = { model: cfg.model, messages, temperature: 0 };
     if (jsonMode) body.response_format = { type: 'json_object' };
+    this.stats.requests += 1;
     const res = await fetchImpl(`${cfg.baseUrl!.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
@@ -169,7 +191,9 @@ export class OpenAICompatibleProvider implements PlannerProvider {
       if (res.status === 400 && jsonMode) return this.chat(messages, false);
       throw err('PLANNER_INVALID_OUTPUT', `规划服务 ${res.status}: ${text.slice(0, 200)}`);
     }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }>; usage?: { input_tokens?: number; prompt_tokens?: number; output_tokens?: number; completion_tokens?: number } };
+    this.stats.inputTokens += data.usage?.input_tokens ?? data.usage?.prompt_tokens ?? 0;
+    this.stats.outputTokens += data.usage?.output_tokens ?? data.usage?.completion_tokens ?? 0;
     return data.choices?.[0]?.message?.content ?? '';
   }
 

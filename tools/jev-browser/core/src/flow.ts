@@ -1,6 +1,6 @@
 import type { ActionStep, FlowStep, StepResult } from './types.js';
 import { err, PauseSignal } from './errors.js';
-import { resolveLocator, verifyExpects } from './locator.js';
+import { resolveLocator, resolveVarPath, verifyExpects } from './locator.js';
 import { performAction, type ArtifactSink, type LedgerHook, type PerformContext } from './executor.js';
 import type { DialogManager } from './connectors.js';
 import type { PagePort } from './ports.js';
@@ -22,10 +22,14 @@ export interface FlowRunContext {
   dialogs?: DialogManager;
   acceptDialogOnce?: boolean;
   maxSteps: number;
+  /** 已派发动作数上限（DESIGN §6.4 预算）。 */
+  maxActions: number;
   /** 动作派发前钩子：PolicyGate + 审批消费（DESIGN §8.2/§10）；抛错则动作不派发。 */
   beforeAction?: (step: ActionStep) => Promise<{ acceptDialogOnce?: boolean } | void>;
   /** 每个步骤边界的截止检查（超限抛错终止）。 */
   checkDeadline?: () => void;
+  /** checkpoint：每个顶层步骤完成、每次 forEach 迭代后调用（崩溃后不重放副作用）。 */
+  onCheckpoint?: () => void;
   onProgress?: (r: StepResult) => void;
   goalRunner?: GoalRunner;
 }
@@ -43,6 +47,7 @@ export interface FlowRunResult {
 
 export class FlowExecutor {
   private stepCount = 0;
+  private actionCount = 0;
   private readonly results: StepResult[] = [];
 
   constructor(
@@ -74,6 +79,7 @@ export class FlowExecutor {
       const r = await this.runOne(step);
       this.results.push(r);
       this.ctx.onProgress?.(r);
+      this.ctx.onCheckpoint?.();
     }
   }
 
@@ -81,6 +87,10 @@ export class FlowExecutor {
     this.tick();
     switch (step.kind) {
       case 'action': {
+        this.actionCount += 1;
+        if (this.actionCount > this.ctx.maxActions) {
+          throw err('BUDGET_EXCEEDED', `实际派发动作超过预算 ${this.ctx.maxActions}`);
+        }
         const p = this.performCtx();
         if (this.ctx.beforeAction) {
           const gate = await this.ctx.beforeAction(step);
@@ -111,7 +121,7 @@ export class FlowExecutor {
         return { id: step.id, kind: 'extract', status: 'done', savedAs: step.saveAs };
       }
       case 'branch': {
-        const actual = this.ctx.vars[step.variable];
+        const actual = resolveVarPath(this.ctx.vars, step.variable);
         if (actual === step.equals) {
           await this.runList(step.then);
         }
@@ -123,18 +133,22 @@ export class FlowExecutor {
           throw err('INVALID_INPUT', `forEach.itemsVar "${step.itemsVar}" 不是数组变量`);
         }
         const bounded = items.slice(0, Math.min(step.maxItems, 30));
-        let iterations = 0;
-        for (const item of bounded) {
+        // 断点续跑：已完成的迭代不重跑（暂停/恢复后 cursor 停在本步骤顶部，
+        // 用 processed 计数跳过，避免重放已执行副作用，DESIGN §8.1/§9.1）
+        const processedBefore = Number(this.ctx.vars[`${step.itemsVar}.processed`] ?? 0);
+        let iterations = Math.min(Number.isFinite(processedBefore) ? processedBefore : 0, bounded.length);
+        for (; iterations < bounded.length; iterations++) {
           if (this.ctx.cancelFlag.cancelled) break;
-          this.ctx.vars[step.itemVar] = item;
+          this.ctx.vars[step.itemVar] = bounded[iterations];
           await this.runList(step.body);
-          iterations += 1;
+          this.ctx.vars[`${step.itemsVar}.processed`] = iterations + 1;
+          this.ctx.onCheckpoint?.(); // 每次迭代后落盘，崩溃后从断点继续
         }
         // 逐项终态记录：未处理项不能计为成功（DESIGN §8.1）
         this.ctx.vars[`${step.itemsVar}.processed`] = iterations;
         this.ctx.vars[`${step.itemsVar}.total`] = items.length;
         if (iterations < items.length) {
-          throw new PauseSignal('needs_input', `forEach 未处理完全部条目（${iterations}/${items.length}），已暂停待人工处理`);
+          throw new PauseSignal('needs_input', `forEach 未处理完全部条目（${iterations}/${items.length}），已暂停待人工处理；已处理项已记录，恢复后从断点继续`);
         }
         return { id: step.id, kind: 'forEach', status: 'done', iterations };
       }

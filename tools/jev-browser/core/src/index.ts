@@ -30,10 +30,11 @@ export type {
   BrowserConnector, Clock, Logger,
 } from './ports.js';
 export { consoleLogger, systemClock, redactUrl } from './ports.js';
+export { resolveAttachEndpoint, discoverChromeLoopbackEndpoint } from './connectors.js';
 export { observePage, diffObservation, waitForSettle, type PageObservation, type ObservedElement } from './observe.js';
 export { resolveLocator, verifyExpects } from './locator.js';
 export { TypeSafeJudge, GOAL_ACTIONS, scopeCandidates, type JudgePort, type RoundDecision, type GoalAction } from './judge.js';
-export { OpenAICompatibleProvider, validatePlannedSteps, type PlannerProvider, type PlannerInput } from './planner.js';
+export { OpenAICompatibleProvider, WRITE_ACTIONS, validatePlannedSteps, type PlannerProvider, type PlannerInput } from './planner.js';
 export { performAction, FsArtifactSink, type ArtifactSink, type LedgerHook, type PerformContext } from './executor.js';
 export { FlowExecutor, type FlowRunContext, type FlowRunResult, type GoalRunner } from './flow.js';
 export { GoalExecutor, type GoalLoopOptions } from './goal.js';
@@ -60,7 +61,7 @@ export const TOOLS: ToolMeta[] = [
   { name: 'browser_select_page', description: '选择/切换会话绑定的标签页' },
   { name: 'browser_execute', description: '执行确定性步骤序列（action/assert/extract，写操作需后置条件，不调用规划模型）' },
   { name: 'browser_run', description: '执行完整目标（内部规划器拆解为步骤；需配置 planner 与 successCriteria）' },
-  { name: 'browser_snapshot', description: '只读页面快照（脱敏，需授权 origin）' },
+  { name: 'browser_snapshot', description: '只读页面快照（脱敏；for-model 需 origin ∈ modelOrigins，默认禁止云外发）' },
   { name: 'browser_act', description: '单步动作（受同一策略/预算/审批约束）' },
   { name: 'browser_task_get', description: '查询任务状态（envelope）' },
   { name: 'browser_task_cancel', description: '取消任务（requestId + expectedRevision）' },

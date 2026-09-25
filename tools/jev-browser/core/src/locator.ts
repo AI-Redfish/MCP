@@ -27,6 +27,17 @@ export interface ExpectContext {
   lastDownload?: { artifactId?: string };
 }
 
+/** 点路径取变量：'items.count' → vars['items']?.count；不存在的路径返回 undefined。 */
+export function resolveVarPath(vars: Record<string, unknown>, path: string): unknown {
+  if (!path.includes('.')) return vars[path];
+  let cur: unknown = vars;
+  for (const seg of path.split('.')) {
+    if (typeof cur !== 'object' || cur === null) return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
 /** 后置条件验证（代码可计算事实优先，DESIGN §6.1）。失败不抛错，返回清单。 */
 export async function verifyExpects(
   page: PagePort,
@@ -77,7 +88,7 @@ export async function verifyExpects(
           break;
         }
         case 'var_equals': {
-          const actual = e.variable ? ctx.vars[e.variable] : undefined;
+          const actual = e.variable ? resolveVarPath(ctx.vars, e.variable) : undefined;
           if (actual !== e.value) {
             failures.push({ kind: e.kind, reason: `变量 ${e.variable} = ${JSON.stringify(actual)} ≠ ${JSON.stringify(e.value)}` });
           }

@@ -33,6 +33,8 @@ export interface LocatorPort {
 
 export interface PagePort {
   url(): string;
+  /** 页面是否已关闭（人工关页/导航崩溃后，候选失效，DESIGN §4.3）。 */
+  isClosed(): boolean;
   title(): Promise<string>;
   goto(url: string, opts?: { timeout?: number; waitUntil?: 'load' | 'domcontentloaded' }): Promise<unknown>;
   locator(spec: LocatorSpec): LocatorPort;

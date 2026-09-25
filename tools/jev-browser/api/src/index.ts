@@ -11,7 +11,6 @@ import {
   SCHEMA_VERSION,
   loadConfig,
   runDoctor,
-  validateExecuteSteps,
   type TaskEnvelope,
 } from '@ai-redfish/jev-browser-core';
 import * as fs from 'node:fs';
@@ -41,7 +40,7 @@ if (!token) {
 const PRINCIPAL = 'api-host';
 const runtime = new Runtime(config);
 const recovery = runtime.recoverOnStartup();
-console.error(`[jev-browser-api] 崩溃恢复: ${recovery.recovered} 个遗留任务转暂停${recovery.isolated ? '；存在未知在途动作已隔离' : ''}`);
+console.error(`[jev-browser-api] 崩溃恢复: ${recovery.recovered} 个遗留任务转暂停，${recovery.expired} 个过期${recovery.isolated ? '；存在未知在途动作已隔离' : ''}`);
 
 const MAX_BODY = 1024 * 1024;
 
@@ -73,109 +72,141 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-/** 创建 API 服务器（测试可注入 runtime；生产入口 main() 使用真实 runtime）。 */
+async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readBody(req);
+  if (!raw.trim()) return {};
+  const parsed = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null) throw new Error('请求体顶层必须是对象');
+  return parsed as Record<string, unknown>;
+}
+
+/** 规范化 Host：去掉端口与 IPv6 括号。 */
+function hostOf(req: http.IncomingMessage): string {
+  const raw = (req.headers.host ?? '').split(',')[0]!.trim();
+  if (raw.startsWith('[')) return raw.slice(1, raw.indexOf(']'));
+  return raw.split(':')[0]!;
+}
+
+/** 创建 API 服务器（测试可注入 runtime；生产入口使用真实 runtime）。 */
 export function createApiServer(rt: Runtime, opts: { token: string }): http.Server {
   const accessToken = opts.token;
   return http.createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-  // Host/Origin 校验：防 DNS rebinding / 浏览器跨站调用（DESIGN §10）
-  const host = (req.headers.host ?? '').split(':')[0];
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    return fail(res, 403, 'POLICY_BLOCKED', `非法 Host: ${host}`);
-  }
-  const auth = req.headers.authorization ?? '';
-  if (auth !== `Bearer ${accessToken}`) {
-    return fail(res, 401, 'GRANT_INVALID', '缺少或不匹配的 Bearer token');
-  }
-  const parts = url.pathname.split('/').filter(Boolean);
-  const idem = req.headers['idempotency-key'] as string | undefined;
-
-  try {
-    // GET /v1/diagnostics
-    if (req.method === 'GET' && url.pathname === '/v1/diagnostics') {
-      const doctor = await runDoctor({});
-      return send(res, 200, { doctor, recovery: { recovered: 0, isolated: false }, schemaVersion: SCHEMA_VERSION });
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    // Host/Origin 校验：防 DNS rebinding / 浏览器跨站调用（DESIGN §10）
+    const host = hostOf(req);
+    if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1' && host !== '[::1]') {
+      return fail(res, 403, 'POLICY_BLOCKED', `非法 Host: ${host}`);
     }
-
-    // POST /v1/sessions
-    if (req.method === 'POST' && url.pathname === '/v1/sessions') {
-      const body = JSON.parse(await readBody(req));
-      const session = await runtime.createSession(PRINCIPAL, body);
-      return send(res, 201, session);
+    const auth = req.headers.authorization ?? '';
+    if (auth !== `Bearer ${accessToken}`) {
+      return fail(res, 401, 'GRANT_INVALID', '缺少或不匹配的 Bearer token');
     }
+    const parts = url.pathname.split('/').filter(Boolean);
+    const idem = req.headers['idempotency-key'] as string | undefined;
+    // 长任务期间周期回收过期暂停（幂等，成本极低）
+    rt.reapExpired();
 
-    // GET /v1/sessions/:id/pages
-    if (req.method === 'GET' && parts[1] === 'sessions' && parts[3] === 'pages') {
-      return send(res, 200, { pages: await runtime.listPages(PRINCIPAL, parts[2]!) });
-    }
-
-    // POST /v1/sessions/:id/page | .../act
-    if (req.method === 'POST' && parts[1] === 'sessions' && (parts[3] === 'page' || parts[3] === 'act')) {
-      const body = JSON.parse(await readBody(req));
-      if (parts[3] === 'page') {
-        return send(res, 200, await runtime.selectPage(PRINCIPAL, parts[2]!, String(body.pageId)));
+    try {
+      // GET /v1/diagnostics
+      if (req.method === 'GET' && url.pathname === '/v1/diagnostics') {
+        const doctor = await runDoctor({});
+        return send(res, 200, { doctor, schemaVersion: SCHEMA_VERSION });
       }
-      const queued = await runtime.act(PRINCIPAL, parts[2]!, { sessionId: parts[2]!, step: body.step, values: body.values ?? {} });
-      return send(res, 202, queued);
-    }
 
-    // POST /v1/tasks/execute | run
-    if (req.method === 'POST' && parts[1] === 'tasks' && (parts[2] === 'execute' || parts[2] === 'run')) {
-      const body = JSON.parse(await readBody(req));
-      const queued = parts[2] === 'execute'
-        ? await runtime.execute(PRINCIPAL, String(body.sessionId), body, { idempotencyKey: idem })
-        : await runtime.run(PRINCIPAL, String(body.sessionId), body, { idempotencyKey: idem });
-      return send(res, 202, queued);
-    }
+      // POST /v1/sessions
+      if (req.method === 'POST' && url.pathname === '/v1/sessions') {
+        const body = await readJsonBody(req);
+        const session = await rt.createSession(PRINCIPAL, body as never);
+        return send(res, 201, session);
+      }
 
-    // GET /v1/tasks/:id
-    if (req.method === 'GET' && parts[1] === 'tasks' && parts.length === 3) {
-      return send(res, 200, { envelope: runtime.getTask(PRINCIPAL, parts[2]!) });
-    }
+      // GET /v1/sessions/:id/pages
+      if (req.method === 'GET' && parts[1] === 'sessions' && parts[3] === 'pages') {
+        return send(res, 200, { pages: await rt.listPages(PRINCIPAL, parts[2]!) });
+      }
 
-    // POST /v1/tasks/:id/cancel|resume|approve
-    if (req.method === 'POST' && parts[1] === 'tasks' && parts.length === 4 && ['cancel', 'resume', 'approve'].includes(parts[3]!)) {
-      const body = parts[3] === 'approve' ? JSON.parse(await readBody(req) || '{}') : JSON.parse(await readBody(req));
-      if (parts[3] === 'cancel') return send(res, 200, { envelope: await runtime.cancelTask(PRINCIPAL, parts[2]!, body) });
-      if (parts[3] === 'resume') return send(res, 200, { envelope: await runtime.resumeTask(PRINCIPAL, parts[2]!, body) });
-      return send(res, 200, { envelope: runtime.approveTask(PRINCIPAL, parts[2]!, String(body.grant)) });
-    }
+      // POST /v1/sessions/:id/page | .../act | .../snapshot
+      if (req.method === 'POST' && parts[1] === 'sessions' && ['page', 'act', 'snapshot'].includes(parts[3] ?? '')) {
+        const body = await readJsonBody(req);
+        if (parts[3] === 'page') {
+          return send(res, 200, await rt.selectPage(PRINCIPAL, parts[2]!, String(body.pageId)));
+        }
+        if (parts[3] === 'snapshot') {
+          return send(res, 200, await rt.snapshot(PRINCIPAL, parts[2]!, { forModel: body.forModel === true }));
+        }
+        const queued = await rt.act(PRINCIPAL, parts[2]!, { sessionId: parts[2]!, step: body.step as never, values: (body.values ?? {}) as never });
+        return send(res, 202, queued);
+      }
 
-    // GET /v1/tasks/:id/artifacts/:artifactId
-    if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts') {
-      const { path: filePath, filename } = runtime.artifactPath(PRINCIPAL, parts[2]!, parts[4]!);
-      const data = fs.readFileSync(filePath);
-      res.writeHead(200, {
-        'content-type': 'application/octet-stream',
-        'content-disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
-      });
-      return res.end(data);
-    }
+      // POST /v1/tasks/execute | run
+      if (req.method === 'POST' && parts[1] === 'tasks' && (parts[2] === 'execute' || parts[2] === 'run')) {
+        const body = await readJsonBody(req);
+        const queued = parts[2] === 'execute'
+          ? await rt.execute(PRINCIPAL, String(body.sessionId), body as never, { idempotencyKey: idem })
+          : await rt.run(PRINCIPAL, String(body.sessionId), body as never, { idempotencyKey: idem });
+        return send(res, 202, queued);
+      }
 
-    // DELETE /v1/sessions/:id
-    if (req.method === 'DELETE' && parts[1] === 'sessions' && parts.length === 3) {
-      const detachTask = url.searchParams.get('detachTask') === 'true';
-      return send(res, 200, await runtime.disconnect(PRINCIPAL, parts[2]!, { detachTask }));
-    }
+      // GET /v1/tasks/:id
+      if (req.method === 'GET' && parts[1] === 'tasks' && parts.length === 3) {
+        return send(res, 200, { envelope: rt.getTask(PRINCIPAL, parts[2]!) });
+      }
 
-    return fail(res, 404, 'NOT_FOUND', `未知路由: ${req.method} ${url.pathname}`);
-  } catch (e) {
-    const errObj = e as { code?: string; message?: string };
-    const statusMap: Record<string, number> = {
-      NOT_FOUND: 404,
-      IDEMPOTENCY_CONFLICT: 409,
-      REVISION_CONFLICT: 409,
-      SESSION_BUSY: 409,
-      BROWSER_BUSY: 409,
-      CONFIG_INVALID: 400,
-      INVALID_INPUT: 400,
-      GRANT_INVALID: 403,
-    };
-    return fail(res, statusMap[errObj.code ?? ''] ?? 500, errObj.code ?? 'INTERNAL', errObj.message ?? String(e));
-  }
-});
-  return server;
+      // GET /v1/tasks/:id/artifacts（列表）
+      if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts' && parts.length === 4) {
+        return send(res, 200, { artifacts: rt.listArtifacts(PRINCIPAL, parts[2]!) });
+      }
+
+      // GET /v1/tasks/:id/artifacts/:artifactId（下载）
+      if (req.method === 'GET' && parts[1] === 'tasks' && parts[3] === 'artifacts' && parts.length === 5) {
+        const { path: filePath, filename } = rt.artifactPath(PRINCIPAL, parts[2]!, parts[4]!);
+        const data = fs.readFileSync(filePath);
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        });
+        return res.end(data);
+      }
+
+      // POST /v1/tasks/:id/cancel|resume|approve
+      if (req.method === 'POST' && parts[1] === 'tasks' && parts.length === 4 && ['cancel', 'resume', 'approve'].includes(parts[3]!)) {
+        const body = await readJsonBody(req);
+        if (parts[3] === 'cancel') return send(res, 200, { envelope: await rt.cancelTask(PRINCIPAL, parts[2]!, body as never) });
+        if (parts[3] === 'resume') return send(res, 200, { envelope: await rt.resumeTask(PRINCIPAL, parts[2]!, body as never) });
+        return send(res, 200, { envelope: rt.approveTask(PRINCIPAL, parts[2]!, String(body.grant)) });
+      }
+
+      // DELETE /v1/sessions/:id
+      if (req.method === 'DELETE' && parts[1] === 'sessions' && parts.length === 3) {
+        const detachTask = url.searchParams.get('detachTask') === 'true';
+        return send(res, 200, await rt.disconnect(PRINCIPAL, parts[2]!, { detachTask }));
+      }
+
+      return fail(res, 404, 'NOT_FOUND', `未知路由: ${req.method} ${url.pathname}`);
+    } catch (e) {
+      const errObj = e as { code?: string; message?: string };
+      const statusMap: Record<string, number> = {
+        NOT_FOUND: 404,
+        IDEMPOTENCY_CONFLICT: 409,
+        REVISION_CONFLICT: 409,
+        SESSION_BUSY: 409,
+        BROWSER_BUSY: 409,
+        TASK_NOT_RESUMABLE: 409,
+        CONFIG_INVALID: 400,
+        INVALID_INPUT: 400,
+        GRANT_INVALID: 403,
+        NEEDS_CONFIRMATION: 409,
+        ORIGIN_NOT_ALLOWED: 403,
+        POLICY_BLOCKED: 403,
+        SESSION_NOT_READY: 409,
+        PAGE_NOT_RESOLVED: 409,
+      };
+      return fail(res, statusMap[errObj.code ?? ''] ?? 500, errObj.code ?? 'INTERNAL', errObj.message ?? String(e));
+    }
+  });
 }
+
+export { runtime as apiRuntime };
 
 const server = createApiServer(runtime, { token: token! });
 const port = flags.port ?? config.api.port;

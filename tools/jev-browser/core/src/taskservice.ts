@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import type {
   ActInput,
+  ArtifactMeta,
   CreateSessionInput,
   ExecuteTaskInput,
   FlowStep,
@@ -16,16 +17,19 @@ import type {
   ValueInput,
 } from './types.js';
 import { SCHEMA_VERSION } from './types.js';
+import type { ErrorCode } from './types.js';
 import { ActionOutcomeUnknownError, JevError, PauseSignal, err } from './errors.js';
 import type { JevBrowserConfig } from './config.js';
 import { credentialPresent } from './config.js';
 import { TaskStore, type TaskRow } from './store.js';
-import { recoverStale, resolveCancelling } from './statemachine.js';
+import { assertTransition, recoverStale, resolveCancelling } from './statemachine.js';
 import { PolicyGate, originOf } from './policy.js';
 import { observePage } from './observe.js';
 import { verifyGrant } from './grants.js';
-import { TypeSafeJudge, type JudgePort } from './judge.js';
-import { OpenAICompatibleProvider, validatePlannedSteps, type PlannerProvider } from './planner.js';
+import { WRITE_ACTIONS, validatePlannedSteps } from './planner.js';
+import type { JudgePort } from './judge.js';
+import { TypeSafeJudge } from './judge.js';
+import { OpenAICompatibleProvider, type PlannerProvider } from './planner.js';
 import { DialogManager, PlaywrightConnector, selectPage } from './connectors.js';
 import { FsArtifactSink, type ArtifactSink, type LedgerHook } from './executor.js';
 import { FlowExecutor, type FlowRunContext, type GoalRunner } from './flow.js';
@@ -54,7 +58,7 @@ export interface SubmitOptions {
 export interface ResumeOptions {
   requestId: string;
   expectedRevision?: number;
-  /** 未知结果/歧义暂停后，人工确认允许重跑当前步骤。 */
+  /** 未知结果/歧义/断连恢复暂停后，人工确认允许重跑当前步骤。 */
   rerunConfirmed?: boolean;
 }
 
@@ -62,6 +66,8 @@ export interface CancelOptions {
   requestId: string;
   expectedRevision?: number;
 }
+
+const RETENTION_MS = 24 * 60 * 60_000; // 幂等/元数据拟保留 24h（DESIGN §9.1）
 
 /** 核心编排（DESIGN §2/§8/§9）：会话、串行队列、预算、取消/恢复/审批、崩溃恢复。 */
 export class Runtime {
@@ -73,6 +79,8 @@ export class Runtime {
   readonly dialogs = new DialogManager();
   private readonly log: Logger;
   private readonly clock: Clock;
+  private readonly connector: BrowserConnector;
+  private readonly heartbeatTimer: NodeJS.Timeout | undefined;
 
   private browser: { port: BrowserPort; ownership: 'borrowed' | 'owned' } | null = null;
   private readonly sessionPages = new Map<string, PagePort>();
@@ -89,9 +97,16 @@ export class Runtime {
     this.judge = opts?.judge ?? new TypeSafeJudge(cfg.jev);
     this.planner = opts?.planner ?? this.buildPlanner();
     this.connector = opts?.connector ?? new PlaywrightConnector(cfg);
+    // 平台用户级锁心跳：仅供人工诊断宿主是否存活；过期不自动抢锁（DESIGN §9.2）
+    this.heartbeatTimer = setInterval(() => {
+      try {
+        this.store.kvSet(`lock:${this.profileKey()}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      } catch {
+        /* 存储不可用时静默；下一次操作会暴露 */
+      }
+    }, 30_000);
+    this.heartbeatTimer.unref?.();
   }
-
-  private readonly connector: BrowserConnector;
 
   private buildPlanner(): PlannerProvider | null {
     if (!this.cfg.planner.enabled) return null;
@@ -100,6 +115,7 @@ export class Runtime {
     return new OpenAICompatibleProvider({ cfg: this.cfg.planner, apiKey: key });
   }
 
+  /** 浏览器实例身份（锁/预约的 key，DESIGN §9.2）。 */
   profileKey(): string {
     const b = this.cfg.browser;
     return b.mode === 'attach' ? `attach:${b.engine}:${b.attach.endpoint}` : `launch:${b.engine}:${b.launch.userDataDir ?? 'default'}`;
@@ -134,10 +150,6 @@ export class Runtime {
     this.store.kvSet(key, JSON.stringify({ pid: process.pid, at: Date.now() }));
   }
 
-  private heartbeat(): void {
-    this.store.kvSet(`lock:${this.profileKey()}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
-  }
-
   // ------------------------------------------------------------------
   // 会话
   // ------------------------------------------------------------------
@@ -153,7 +165,8 @@ export class Runtime {
 
     if (input.target.kind === 'new') {
       const url = input.target.url;
-      const decision = this.policy.decide({ action: 'navigate', pageUrl: url, navigateTo: url });
+      // 新建页必须在会话授权域内：任务不能自行扩大权限（DESIGN §8.1）
+      const decision = this.policy.decide({ action: 'navigate', pageUrl: url, navigateTo: url, sessionAllowedOrigins: input.allowedOrigins });
       if (!decision.allow) throw err(decision.code, decision.reason);
       page = await context.newPage(url);
       this.sessionPages.set(sessionId, page);
@@ -208,15 +221,15 @@ export class Runtime {
 
   async disconnect(principal: string, sessionId: string, opts: { detachTask?: boolean } = {}): Promise<{ disconnected: boolean }> {
     const s = this.requireSession(principal, sessionId);
-    const stale = this.store.listStale(['queued', 'running', 'cancelling']).filter((t) => t.sessionId === sessionId);
-    if (stale.length > 0) throw err('SESSION_BUSY', `会话仍有活动任务: ${stale.map((t) => t.taskId).join(',')}`);
+    const active = this.store.listStale(['queued', 'running', 'cancelling']).filter((t) => t.sessionId === sessionId);
+    if (active.length > 0) throw err('SESSION_BUSY', `会话仍有活动任务: ${active.map((t) => t.taskId).join(',')}`);
     const pausedTasks = this.store.listStale(['paused']).filter((t) => t.sessionId === sessionId);
     if (pausedTasks.length > 0 && !opts.detachTask) {
       throw err('SESSION_BUSY', `会话有暂停任务，需显式 detachTask=true（保留预约与审批需求）: ${pausedTasks.map((t) => t.taskId).join(',')}`);
     }
     this.sessionPages.delete(sessionId);
     this.store.upsertSession({ ...s, status: 'disconnected' });
-    // 最后一个绑定页且无暂停预约时才关闭宿主连接（DESIGN §4.3）
+    // 最后一个绑定页且整个 profile 无暂停预约时才释放宿主连接（DESIGN §4.3）
     const remainingPaused = this.store.listStale(['paused']);
     if (this.sessionPages.size === 0 && remainingPaused.length === 0 && this.browser) {
       await this.browser.port.close().catch(() => undefined);
@@ -234,6 +247,10 @@ export class Runtime {
     const s = this.requireSession(principal, sessionId);
     if (s.status !== 'ready') throw err('SESSION_NOT_READY', `会话未就绪（${s.status}），先 select-page`);
     validateExecuteSteps(input.steps);
+    // 含 goal 步骤时需要 Jev：提前快速失败，而不是执行一半后失败（DESIGN §6.1）
+    if (input.steps.some((st) => st.kind === 'goal') && !this.judge.available()) {
+      throw err('JEV_NOT_CONFIGURED', `execute 中的 goal 步骤需要 Jev key（${this.cfg.jev.apiKeyEnv}）`);
+    }
     return this.enqueueTask(principal, sessionId, 'execute', input, opts, input.budget);
   }
 
@@ -245,6 +262,9 @@ export class Runtime {
     }
     if (!this.planner) {
       throw err('PLANNER_NOT_CONFIGURED', 'planner 未启用或未配置 provider/baseUrl/model');
+    }
+    if (!this.judge.available()) {
+      throw err('JEV_NOT_CONFIGURED', 'run 的任务级验收需要 Jev key；纯确定性 execute 不需要它');
     }
     return this.enqueueTask(principal, sessionId, 'run', input, opts, input.budget);
   }
@@ -263,23 +283,11 @@ export class Runtime {
     opts: SubmitOptions,
     budget?: { deadlineAt?: number },
   ): Promise<TaskEnvelope> {
+    this.reapExpired();
     const now = this.clock.now();
     const bodyHash = sha256(JSON.stringify(request));
     const taskId = newId('t');
-    if (opts.idempotencyKey) {
-      const pkey = `submit:${principal}:${mode}:${opts.idempotencyKey}`;
-      const existing = this.store.findIdempotent(pkey);
-      if (existing) {
-        if (existing.bodyHash !== bodyHash) throw err('IDEMPOTENCY_CONFLICT', '相同 Idempotency-Key 但请求体不同');
-        const row = this.store.getTask(existing.taskId);
-        if (row) return this.envelope(row);
-      }
-      this.store.putIdempotent(pkey, bodyHash, taskId);
-    }
-    const deadline = Math.min(
-      now + this.cfg.runtime.taskTtlMs,
-      budget?.deadlineAt ?? Number.MAX_SAFE_INTEGER,
-    );
+    const deadline = Math.min(now + this.cfg.runtime.taskTtlMs, budget?.deadlineAt ?? Number.MAX_SAFE_INTEGER);
     const row: TaskRow = {
       taskId,
       sessionId,
@@ -299,7 +307,24 @@ export class Runtime {
       updatedAt: now,
       deadlineAt: deadline === Number.MAX_SAFE_INTEGER ? null : deadline,
     };
-    this.store.insertTask(row);
+    // 幂等记录与任务创建原子提交（DESIGN §8.3）；返回实际生效的 taskId
+    const effectiveId = this.store.tx(() => {
+      if (opts.idempotencyKey) {
+        const pkey = `submit:${principal}:${mode}:${opts.idempotencyKey}`;
+        const existing = this.store.findIdempotent(pkey);
+        if (existing) {
+          if (existing.bodyHash !== bodyHash) throw err('IDEMPOTENCY_CONFLICT', '相同 Idempotency-Key 但请求体不同');
+          const prev = this.store.getTask(existing.taskId);
+          if (prev) return existing.taskId;
+        }
+        this.store.putIdempotent(pkey, bodyHash, taskId);
+      }
+      this.store.insertTask(row);
+      return taskId;
+    });
+    if (effectiveId !== taskId) {
+      return this.envelope(this.store.getTask(effectiveId)!);
+    }
 
     const pk = this.profileKey();
     const prev = this.queues.get(pk) ?? Promise.resolve();
@@ -313,18 +338,17 @@ export class Runtime {
   /** 等待任务到达终态或暂停（CLI 同步语义；HTTP 用轮询）。 */
   waitEnvelope(taskId: string): Promise<TaskEnvelope> {
     const row = this.store.getTask(taskId);
-    if (row) {
-      const env = this.envelope(row);
-      if (env.status === 'paused' || isTerminalStatus(env.status)) return Promise.resolve(env);
-    }
+    if (!row) return Promise.reject(err('NOT_FOUND', `任务不存在: ${taskId}`));
+    const env = this.envelope(row);
+    if (env.status === 'paused' || isTerminalStatus(env.status)) return Promise.resolve(env);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const clean = this.waiters.delete(taskId);
         if (clean) reject(err('ACTION_TIMEOUT', '等待任务超时（宿主未在期限内收敛）', { retryable: true }));
       }, 30 * 60_000);
-      this.waiters.set(taskId, (env) => {
+      this.waiters.set(taskId, (e) => {
         clearTimeout(timer);
-        resolve(env);
+        resolve(e);
       });
     });
   }
@@ -339,10 +363,10 @@ export class Runtime {
     if (isTerminalStatus(row.status as TaskStatus)) return;
 
     const pk = this.profileKey();
-    // 隔离检查：存在未知在途动作时拒绝新写任务（DESIGN §8.2）
-    const isolation = this.store.kvGet(`isolation:${pk}`);
-    if (isolation && isolation !== taskId) {
-      this.transitionTo(row, 'failed', { error: { code: 'BROWSER_BUSY', message: `存在未对账的未知在途动作（${isolation}），人工处理前不接新任务`, retryable: false } });
+    // 隔离检查：存在未知在途动作时拒绝新的写任务（只读请求放行，DESIGN §8.2）
+    const isolationRaw = this.store.kvGet(`isolation:${pk}`);
+    if (isolationRaw && JSON.parse(isolationRaw).taskId !== taskId && !isReadOnlyRequest(row)) {
+      this.transitionTo(row, 'failed', { error: { code: 'BROWSER_BUSY', message: `存在未对账的未知在途动作（${JSON.parse(isolationRaw).taskId}），人工处理前不接新写任务`, retryable: false } });
       this.resolveWaiter(taskId);
       return;
     }
@@ -372,10 +396,10 @@ export class Runtime {
       return;
     }
     this.store.kvSet(`reserve:${pk}`, JSON.stringify({ taskId, state: 'running', at: Date.now() }));
-    this.heartbeat();
+    this.store.kvSet(`lock:${pk}`, JSON.stringify({ pid: process.pid, at: Date.now() }));
 
     const startedAt = this.clock.now();
-    const metrics = JSON.parse(row.metricsJson) as { queuedMs?: number; runningMs?: number; actions?: number; jevRequests?: number; plannerRequests?: number };
+    const metrics = JSON.parse(row.metricsJson) as { queuedMs?: number; runningMs?: number; actions?: number; jevRequests?: number; plannerRequests?: number; inputTokens?: number; outputTokens?: number };
     metrics.queuedMs = startedAt - row.createdAt;
     if (!this.transitionTo(row, 'running')) {
       this.resolveWaiter(taskId);
@@ -399,29 +423,40 @@ export class Runtime {
     const artifactsDir = path.join(this.cfg.runtime.dataDir, 'artifacts', taskId);
     const artifacts: ArtifactSink = new FsArtifactSink(artifactsDir);
 
-    const persist = (patch: Partial<{ cursor: number; varsJson: string; resultsJson: string; metricsJson: string; errorJson: string | null; goalJson: string | null }> = {}) => {
+    const pullUsage = () => {
+      const ju = this.judge.usage();
+      metrics.jevRequests = ju.jevRequests;
+      metrics.inputTokens = ju.inputTokens;
+      metrics.outputTokens = ju.outputTokens;
+      if (this.planner?.usage) {
+        const pu = this.planner.usage();
+        metrics.plannerRequests = Math.max(metrics.plannerRequests ?? 0, pu.requests);
+        metrics.inputTokens = (metrics.inputTokens ?? 0) + pu.inputTokens;
+        metrics.outputTokens = (metrics.outputTokens ?? 0) + pu.outputTokens;
+      }
+    };
+    const persist = (patch: Partial<{ cursor: number; goalJson: string | null }> = {}) => {
       const cur = this.store.getTask(taskId);
       if (!cur) return;
+      pullUsage();
       this.store.transition(taskId, cur.revision, {
         status: cur.status,
-        pauseReason: cur.pauseReason,
         cursor: patch.cursor ?? cur.cursor,
-        varsJson: patch.varsJson ?? JSON.stringify(vars),
-        resultsJson: patch.resultsJson ?? JSON.stringify(results),
-        metricsJson: patch.metricsJson ?? JSON.stringify({ ...metrics, jevRequests: this.judge.usage().jevRequests }),
-        errorJson: patch.errorJson ?? cur.errorJson,
-        goalJson: patch.goalJson ?? cur.goalJson,
+        varsJson: JSON.stringify(vars),
+        resultsJson: JSON.stringify(results),
+        metricsJson: JSON.stringify(metrics),
+        goalJson: patch.goalJson !== undefined ? patch.goalJson : cur.goalJson,
       });
     };
 
     const ledger: LedgerHook = {
-      prepared: (_s, rev) => this.store.setActionState(taskId, rev, 'prepared', JSON.stringify(revArg(_s))),
-      inFlight: (_s, rev) => this.store.setActionState(taskId, rev, 'in_flight'),
-      finished: (_s, rev, state, detail) => this.store.setActionState(taskId, rev, state, undefined, detail ? JSON.stringify(detail) : undefined),
+      prepared: (s, rev) => this.store.setActionState(taskId, rev, 'prepared', JSON.stringify(s)),
+      inFlight: (s, rev) => this.store.setActionState(taskId, rev, 'in_flight', JSON.stringify(s)),
+      finished: (s, rev, state, detail) => this.store.setActionState(taskId, rev, state, undefined, detail ? JSON.stringify({ stepId: s.id, ...detail }) : undefined),
     };
 
-    const sessionRow = row;
-    const gate = this.makeGate(taskId, () => this.sessionPages.get(sessionRow.sessionId)?.url() ?? '');
+    const gateSessionId = row.sessionId;
+    const gate = this.makeGate(taskId, () => allowedOrigins, () => this.sessionPages.get(gateSessionId)?.url() ?? '');
 
     try {
       const page = this.requirePage(row.sessionId);
@@ -430,6 +465,9 @@ export class Runtime {
         const req = request as unknown as { goal: string; successCriteria: string; values?: Record<string, ValueInput> };
         if (!row.goalJson) {
           if (!this.planner) throw err('PLANNER_NOT_CONFIGURED', 'planner 未配置');
+          if ((metrics.plannerRequests ?? 0) + 1 > this.cfg.runtime.maxPlannerRequests) {
+            throw err('BUDGET_EXCEEDED', `规划请求数超过预算 ${this.cfg.runtime.maxPlannerRequests}`);
+          }
           metrics.plannerRequests = (metrics.plannerRequests ?? 0) + 1;
           const planned = await this.planner.plan({
             goal: req.goal,
@@ -448,8 +486,7 @@ export class Runtime {
           steps = JSON.parse(row.goalJson) as FlowStep[];
         }
       } else {
-        const req = request as unknown as { steps: FlowStep[] };
-        steps = req.steps;
+        steps = (request as unknown as { steps: FlowStep[] }).steps;
       }
 
       const goalRunner: GoalRunner = async (p, goalStep, fctx) => {
@@ -462,6 +499,8 @@ export class Runtime {
           allowedOrigins,
           maxActions: this.cfg.runtime.maxActions,
           maxJevRequests: this.cfg.runtime.maxJevRequests,
+          maxInputTokens: this.cfg.runtime.maxInputTokens,
+          maxOutputTokens: this.cfg.runtime.maxOutputTokens,
           actionTimeoutMs: this.cfg.runtime.actionTimeoutMs,
           thresholds: {
             doneAt: this.cfg.jev.doneAt,
@@ -473,8 +512,7 @@ export class Runtime {
           cancelFlag,
           dialogs: fctx.dialogs,
           requestApproval: async (step) => {
-            await gate(step); // 允许：返回 true；需要确认：gate 内抛 PauseSignal(needs_confirmation)
-            return true;
+            await gate(step); // 未授权时抛 PauseSignal(needs_confirmation)，动作不派发
           },
           nextActionRevision: () => ++seq,
         });
@@ -490,50 +528,64 @@ export class Runtime {
         actionTimeoutMs: this.cfg.runtime.actionTimeoutMs,
         cancelFlag,
         dialogs: this.dialogs,
-        maxSteps: Math.min(this.cfg.runtime.maxSteps, 10_000),
+        maxSteps: this.cfg.runtime.maxSteps,
+        maxActions: this.cfg.runtime.maxActions,
         beforeAction: async (step) => {
-          const gateRes = await gate(step);
-          return { acceptDialogOnce: gateRes?.acceptDialogOnce };
+          await gate(step);
+          return {};
         },
         checkDeadline: () => {
           if (cancelFlag.cancelled) throw err('POLICY_BLOCKED', '任务已取消');
           if (this.clock.now() > runDeadline) throw new DeadlineSignal();
         },
+        onCheckpoint: () => {
+          // cursor = 首个未完成的顶层步骤（断点续跑从这快开始，不重放已成功步骤）
+          const doneIds = new Set(results.filter((r) => r.status === 'done').map((r) => r.id));
+          const cursor = steps.findIndex((s) => !doneIds.has(s.id));
+          persist({ cursor: cursor === -1 ? steps.length : cursor });
+        },
         goalRunner,
         onProgress: (r) => {
           if (r.kind === 'action' && r.status === 'done') metrics.actions = (metrics.actions ?? 0) + 1;
-          if (r.status === 'done' && steps.some((s) => s.id === r.id)) {
-            const doneIds = new Set(results.filter((x) => x.status === 'done').map((x) => x.id));
-            doneIds.add(r.id);
-            const cursor = steps.findIndex((s) => !doneIds.has(s.id));
-            persist({ cursor: cursor === -1 ? steps.length : cursor });
-          }
         },
       };
 
-      // 断点续跑：cursor 之前的顶层步骤已完成
+      // 断点续跑：cursor 之前的顶层步骤已完成（cursor 在每次 checkpoint 时推进）
       const remaining = steps.slice(row.cursor);
       const flow = new FlowExecutor(page, flowCtx);
       await flow.run(remaining);
 
       if (cancelFlag.cancelled) {
         row = this.store.getTask(taskId)!;
+        metrics.runningMs = (metrics.runningMs ?? 0) + (this.clock.now() - startedAt);
         this.transitionTo(row, resolveCancelling(runningCtx.stopReason), { resultsJson: JSON.stringify(results), metricsJson: JSON.stringify(metrics) });
       } else {
         let verification: { by: 'deterministic' | 'semantic'; ok: boolean; detail?: string };
         if (row.mode === 'run') {
           const req = request as unknown as { successCriteria: string };
-          const p = await this.judge.check({ url: page.url(), evidence: results.filter((r) => r.status === 'done').length }, `任务级验收：${req.successCriteria}`);
-          if (p < 0.7) {
-            throw new PauseSignal('needs_input', `规划步骤完成但任务级验收未证实（p=${p.toFixed(2)}）：${req.successCriteria}`);
+          // 任务级验收的外发同样受 modelOrigins 约束（DESIGN §10）
+          if (!modelOrigins.includes(originOf(page.url()))) {
+            throw new PauseSignal('needs_input', `任务级验收需要云模型，但当前页 origin 不在 modelOrigins 内: ${originOf(page.url())}`);
+          }
+          const p = await this.judge.check(
+            { url: redactForEvidence(page.url()), doneSteps: results.filter((r) => r.status === 'done').map((r) => r.id) },
+            `任务级验收：${req.successCriteria}`,
+          );
+          if (p < this.cfg.jev.doneAt) {
+            // 步骤全成功但总目标未证实 → 不计 done（DESIGN §8.2）
+            throw new PauseSignal('likely_done', `规划步骤已执行完，但任务级验收未证实（p=${p.toFixed(2)}）：${req.successCriteria}`);
           }
           verification = { by: 'semantic', ok: true, detail: `p=${p.toFixed(2)}` };
         } else {
           verification = { by: 'deterministic', ok: true };
         }
         row = this.store.getTask(taskId)!;
+        metrics.runningMs = (metrics.runningMs ?? 0) + (this.clock.now() - startedAt);
+        pullUsage();
         this.store.transition(taskId, row.revision, {
           status: 'done',
+          pauseReason: null,
+          errorJson: null,
           goalJson: JSON.stringify(verification),
           resultsJson: JSON.stringify(results),
           varsJson: JSON.stringify(vars),
@@ -542,22 +594,25 @@ export class Runtime {
       }
     } catch (e) {
       row = this.store.getTask(taskId)!;
+      metrics.runningMs = (metrics.runningMs ?? 0) + (this.clock.now() - startedAt);
+      pullUsage();
+      const metricsJson = JSON.stringify(metrics);
       if (e instanceof DeadlineSignal || cancelFlag.cancelled) {
         const target = e instanceof DeadlineSignal ? 'expired' : resolveCancelling(runningCtx.stopReason);
-        this.transitionTo(row, target, { resultsJson: JSON.stringify(results), metricsJson: JSON.stringify(metrics) });
+        this.transitionTo(row, target, { resultsJson: JSON.stringify(results), metricsJson });
       } else if (e instanceof PauseSignal) {
         const pending = (e.detail as { pendingApproval?: PendingApproval } | undefined)?.pendingApproval;
-        this.transitionTo(row, 'paused', {
-          errorJsonRaw: pending ? JSON.stringify({ code: 'NEEDS_CONFIRMATION', message: e.message, pendingApproval: pending }) : JSON.stringify({ code: 'NEEDS_INPUT', message: e.message }),
-          resultsJson: JSON.stringify(results),
-          metricsJson: JSON.stringify(metrics),
-        }, e.reason);
+        const errorJson = pending
+          ? JSON.stringify({ code: 'NEEDS_CONFIRMATION', message: e.message, retryable: false, pendingApproval: pending })
+          : JSON.stringify({ code: pauseErrorCode(e.reason), message: e.message, retryable: false });
+        this.transitionTo(row, 'paused', { errorJsonRaw: errorJson, resultsJson: JSON.stringify(results), metricsJson }, e.reason);
       } else if (e instanceof ActionOutcomeUnknownError) {
+        // 结果未知：隔离 profile，人工对账前不接新写任务（DESIGN §8.2）
         this.store.kvSet(`isolation:${pk}`, JSON.stringify({ taskId, at: Date.now(), reason: 'ACTION_OUTCOME_UNKNOWN' }));
         this.transitionTo(row, 'paused', {
           errorJsonRaw: JSON.stringify({ code: 'ACTION_OUTCOME_UNKNOWN', message: e.message, retryable: false }),
           resultsJson: JSON.stringify(results),
-          metricsJson: JSON.stringify(metrics),
+          metricsJson,
         }, 'needs_input');
       } else {
         const jev = e as JevError;
@@ -565,29 +620,36 @@ export class Runtime {
         this.transitionTo(row, 'failed', {
           errorJsonRaw: JSON.stringify({ code, message: (e as Error).message.slice(0, 400), retryable: jev.retryable ?? false }),
           resultsJson: JSON.stringify(results),
-          metricsJson: JSON.stringify(metrics),
+          metricsJson,
         });
       }
     } finally {
       this.running.delete(taskId);
-      const final = this.store.getTask(taskId)!;
-      if (isTerminalStatus(final.status as TaskStatus)) {
-        this.store.kvDel(`reserve:${pk}`);
-      } else if (final.status === 'paused') {
-        this.store.kvSet(`reserve:${pk}`, JSON.stringify({ taskId, state: 'paused', at: Date.now() }));
+      const final = this.store.getTask(taskId);
+      if (final) {
+        if (isTerminalStatus(final.status as TaskStatus)) {
+          // 本任务终态且隔离记录属于本任务：人工已通过 rerunConfirmed 确认，解除隔离
+          const iso = this.store.kvGet(`isolation:${pk}`);
+          if (iso && JSON.parse(iso).taskId === taskId) {
+            this.store.kvDel(`isolation:${pk}`);
+          }
+          this.store.kvDel(`reserve:${pk}`);
+        } else if (final.status === 'paused') {
+          this.store.kvSet(`reserve:${pk}`, JSON.stringify({ taskId, state: 'paused', at: Date.now() }));
+        }
       }
-      metrics.runningMs = (metrics.runningMs ?? 0) + (this.clock.now() - startedAt);
       this.resolveWaiter(taskId);
     }
   }
 
-  private makeGate(taskId: string, getPageUrl: () => string) {
+  private makeGate(taskId: string, getAllowedOrigins: () => string[], getPageUrl: () => string) {
     return async (step: import('./types.js').ActionStep): Promise<{ acceptDialogOnce?: boolean } | undefined> => {
       const decision = this.policy.decide({
         action: step.action,
         target: step.target,
         pageUrl: getPageUrl(),
         navigateTo: step.action === 'navigate' ? String(step.value ?? '') : undefined,
+        sessionAllowedOrigins: getAllowedOrigins(),
       });
       if (decision.allow) return {};
       if (decision.code === 'NEEDS_CONFIRMATION') {
@@ -596,12 +658,9 @@ export class Runtime {
         if (grant) {
           const key = process.env.JEV_BROWSER_APPROVAL_KEY;
           if (!key) throw err('GRANT_INVALID', '缺少 JEV_BROWSER_APPROVAL_KEY，无法核验审批');
-          const payload = verifyGrant(grant.token, key, { taskId });
-          if (payload.actionRevision !== actionRevision) {
-            throw err('GRANT_INVALID', `grant 绑定的 actionRevision 不匹配`);
-          }
+          const payload = verifyGrant(grant.token, key, { taskId, actionRevision });
           if (this.store.consumeGrant(grant.grantId)) {
-            return { acceptDialogOnce: false };
+            return {}; // grant 与 actionRevision 绑定且一次性消费（DESIGN §10）
           }
         }
         throw new PauseSignal('needs_confirmation', `动作需要人工确认: ${decision.reason}`, {
@@ -618,29 +677,31 @@ export class Runtime {
   }
 
   // ------------------------------------------------------------------
-  // 查询 / 取消 / 恢复 / 审批
+  // 查询 / 快照 / 取消 / 恢复 / 审批
   // ------------------------------------------------------------------
 
   getTask(principal: string, taskId: string): TaskEnvelope {
-    const row = this.store.getTask(taskId);
-    if (!row || row.principal !== principal) throw err('NOT_FOUND', `任务不存在: ${taskId}`);
+    const row = this.requireTask(principal, taskId);
     return this.envelope(row);
   }
 
-  /** 只读快照（browser_snapshot）：不建任务、不写库，受 origin/modelOrigins 约束。 */
+  listArtifacts(principal: string, taskId: string): ArtifactMeta[] {
+    this.requireTask(principal, taskId);
+    return this.store.listArtifactsByTask(taskId).map(({ artifactId, filename, size, sha256 }) => ({ artifactId, filename, size, sha256 }));
+  }
+
+  /** 只读快照（browser_snapshot）：不建任务、受 origin/modelOrigins 约束。 */
   async snapshot(principal: string, sessionId: string, opts: { forModel?: boolean } = {}): Promise<unknown> {
     const s = this.requireSession(principal, sessionId);
     const page = this.sessionPages.get(sessionId);
     if (!page) throw err('SESSION_NOT_READY', '会话没有可用页面');
     const allowed: string[] = JSON.parse(s.allowedJson);
-    const obs = await observePage(page, { allowedOrigins: allowed });
-    if (opts.forModel) {
-      const modelOrigins: string[] = JSON.parse(s.modelJson);
-      if (modelOrigins.length > 0 && !modelOrigins.includes(originOf(obs.url))) {
-        throw err('ORIGIN_NOT_ALLOWED', `当前页 origin 不在 modelOrigins 内: ${originOf(obs.url)}`);
-      }
+    const modelOrigins: string[] = JSON.parse(s.modelJson);
+    if (opts.forModel && !modelOrigins.includes(originOf(page.url()))) {
+      // 空列表 = 全部禁止外发（DESIGN §10 默认不许可）
+      throw err('ORIGIN_NOT_ALLOWED', `forModel 快照要求 origin ∈ modelOrigins（当前为空或未包含）: ${originOf(page.url())}`);
     }
-    return obs;
+    return observePage(page, { allowedOrigins: allowed });
   }
 
   async cancelTask(principal: string, taskId: string, opts: CancelOptions): Promise<TaskEnvelope> {
@@ -657,26 +718,31 @@ export class Runtime {
     }
     const runningCtx = this.running.get(taskId);
     if (status === 'running' && runningCtx) {
+      // 进入 cancelling：在途动作先 settle/隔离，之后按 stopReason 收敛（DESIGN §8.2）
       runningCtx.stopReason = 'user_cancel';
       runningCtx.cancelFlag.cancelled = true;
-      this.store.transition(taskId, row.revision, { status: 'cancelling' });
+      this.store.transition(taskId, row.revision, {
+        status: 'cancelling',
+        errorJson: JSON.stringify({ code: 'CANCEL_PENDING', message: '取消中', retryable: false, stopReason: 'user_cancel' }),
+      });
       this.store.putIdempotent(`cancel:${taskId}:${opts.requestId}`, sha256('cancelling'), taskId);
       return this.envelope(this.store.getTask(taskId)!);
     }
     if (status === 'cancelling') {
+      this.store.putIdempotent(`cancel:${taskId}:${opts.requestId}`, sha256('cancelling'), taskId);
       return this.envelope(this.store.getTask(taskId)!);
     }
     const pk = this.profileKey();
-    const target: TaskStatus = status === 'queued' ? 'cancelled' : 'cancelled';
-    this.store.transition(taskId, row.revision, { status: target });
+    assertTransition(status, 'cancelled');
+    this.store.transition(taskId, row.revision, { status: 'cancelled', pauseReason: null });
     if (status === 'paused') this.store.kvDel(`reserve:${pk}`);
-    this.store.putIdempotent(`cancel:${taskId}:${opts.requestId}`, sha256(target), taskId);
+    this.store.putIdempotent(`cancel:${taskId}:${opts.requestId}`, sha256('cancelled'), taskId);
     this.resolveWaiter(taskId);
     return this.envelope(this.store.getTask(taskId)!);
   }
 
   async resumeTask(principal: string, taskId: string, opts: ResumeOptions): Promise<TaskEnvelope> {
-    const row = this.requireTask(principal, taskId);
+    let row = this.requireTask(principal, taskId);
     const replay = this.store.findIdempotent(`resume:${taskId}:${opts.requestId}`);
     if (replay) return this.envelope(this.store.getTask(replay.taskId)!);
     if (opts.expectedRevision !== undefined && opts.expectedRevision !== row.revision) {
@@ -685,34 +751,32 @@ export class Runtime {
     if (row.status !== 'paused') {
       throw err('TASK_NOT_RESUMABLE', `任务状态 ${row.status} 不可恢复（仅 paused 可恢复）`);
     }
-    const errInfo = row.errorJson ? (JSON.parse(row.errorJson) as { code?: string; message?: string }) : null;
-    const needsConfirm = row.pauseReason === 'needs_confirmation';
-    const needsRerunConfirm = ['ambiguous', 'interrupted', 'needs_input'].includes(row.pauseReason ?? '') &&
-      (errInfo?.code === 'ACTION_OUTCOME_UNKNOWN' || row.mode !== 'act');
-    if (needsConfirm) {
-      const actionRevision = errInfo ? (JSON.parse(row.errorJson!) as { pendingApproval?: PendingApproval }).pendingApproval?.actionRevision : undefined;
-      const grant = actionRevision !== undefined ? this.store.findGrant(taskId, actionRevision) : undefined;
+    if (row.deadlineAt !== null && this.clock.now() > row.deadlineAt) {
+      this.store.transition(taskId, row.revision, { status: 'expired', pauseReason: null });
+      throw err('TASK_NOT_RESUMABLE', '任务已超过绝对有效期（expired），不可恢复');
+    }
+    const errInfo = row.errorJson ? (JSON.parse(row.errorJson) as { code?: string }) : null;
+    // 未知结果/歧义/断连恢复必须显式确认（DESIGN §8.2：不确定不自动重放）
+    const needsRerunConfirm = errInfo?.code === 'ACTION_OUTCOME_UNKNOWN' || row.pauseReason === 'ambiguous' || row.pauseReason === 'interrupted';
+    if (row.pauseReason === 'needs_confirmation') {
+      const pending = errInfo ? (JSON.parse(row.errorJson!) as { pendingApproval?: PendingApproval }).pendingApproval : undefined;
+      const grant = pending ? this.store.findGrant(taskId, pending.actionRevision) : undefined;
       if (!grant) {
-        throw err('NEEDS_CONFIRMATION', `任务等待审批（actionRevision=${actionRevision}）；请先签发 grant 并调用 approve`);
+        throw err('NEEDS_CONFIRMATION', `任务等待审批（actionRevision=${pending?.actionRevision}）；请先签发 grant 并调用 approve`);
       }
     } else if (needsRerunConfirm && !opts.rerunConfirmed) {
       throw err('TASK_NOT_RESUMABLE', '该暂停涉及未证实结果或人工核验，需要显式 rerunConfirmed=true');
     }
-    // 页面重绑定（重启/断开后）：重新选页并核验
-    if (!this.sessionPages.has(row.sessionId)) {
-      const session = this.store.getSession(row.sessionId);
-      if (session && session.status !== 'disconnected') {
-        try {
-          await this.ensureBrowser();
-          const context = (await this.ensureBrowser()).browser.contexts()[0];
-          const sel = await selectPage(context, session.pageId ?? undefined);
-          if (sel.page) this.sessionPages.set(row.sessionId, sel.page);
-        } catch {
-          // 保持暂停：resume 后 runTask 会转 needs_input
-        }
+    // 页面重绑定（重启/断开后）：重建连接、重选页并核验（DESIGN §8.2）
+    if (!this.sessionPages.has(row.sessionId) || this.sessionPages.get(row.sessionId)!.isClosed()) {
+      const rebound = await this.rebindSessionPage(row.sessionId);
+      if (!rebound) {
+        return this.envelope(this.store.getTask(taskId)!); // 保持 paused，等用户 select-page
       }
     }
-    this.store.transition(taskId, row.revision, { status: 'queued' });
+    row = this.store.getTask(taskId)!;
+    if (row.status !== 'paused') return this.envelope(row);
+    this.store.transition(taskId, row.revision, { status: 'queued', pauseReason: null, errorJson: null });
     this.store.putIdempotent(`resume:${taskId}:${opts.requestId}`, sha256('queued'), taskId);
     const pk = this.profileKey();
     const prev = this.queues.get(pk) ?? Promise.resolve();
@@ -720,11 +784,31 @@ export class Runtime {
     return this.envelope(this.store.getTask(taskId)!);
   }
 
+  /** 恢复前重建会话页面绑定；失败保持 paused（不自动换页猜测）。 */
+  private async rebindSessionPage(sessionId: string): Promise<boolean> {
+    const session = this.store.getSession(sessionId);
+    if (!session) return false;
+    try {
+      const { browser } = await this.ensureBrowser();
+      const context = browser.contexts()[0];
+      if (!context) return false;
+      const sel = await selectPage(context, session.pageId ?? undefined);
+      if (!sel.page) return false;
+      this.sessionPages.set(sessionId, sel.page);
+      this.store.upsertSession({ ...session, status: 'ready' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   approveTask(principal: string, taskId: string, token: string): TaskEnvelope {
     const row = this.requireTask(principal, taskId);
     const key = process.env.JEV_BROWSER_APPROVAL_KEY;
     if (!key) throw err('GRANT_INVALID', '缺少 JEV_BROWSER_APPROVAL_KEY（独立签发凭据，不注入执行 Agent）');
+    // 先校验并暂存 grant，不执行动作；resume 后派发前才原子消费（DESIGN §8.2）
     const payload = verifyGrant(token, key, { taskId });
+    if (payload.expiresAt < this.clock.now()) throw err('GRANT_INVALID', 'grant 已过期');
     this.store.putGrant({
       grantId: payload.grantId,
       taskId,
@@ -732,23 +816,22 @@ export class Runtime {
       token,
       expiresAt: payload.expiresAt,
     });
-    return this.envelope(this.store.getTask(taskId)!);
+    return this.envelope(row);
   }
 
   artifactPath(principal: string, taskId: string, artifactId: string): { path: string; filename: string } {
-    const row = this.requireTask(principal, taskId);
-    void row;
+    this.requireTask(principal, taskId);
     const art = this.store.getArtifact(artifactId);
     if (!art || art.taskId !== taskId) throw err('ARTIFACT_NOT_FOUND', `artifact 不存在: ${artifactId}`);
     return { path: art.path, filename: art.filename };
   }
 
   // ------------------------------------------------------------------
-  // 崩溃恢复 / 关闭
+  // 崩溃恢复 / 过期回收 / 关闭
   // ------------------------------------------------------------------
 
-  recoverOnStartup(): { recovered: number; isolated: boolean } {
-    let recovered = 0;
+  recoverOnStartup(): { recovered: number; expired: number; isolated: boolean } {
+    this.store.pruneIdempotency(RETENTION_MS);
     const unresolved = this.store.unresolvedActions();
     for (const a of new Set(unresolved.map((u) => u.taskId))) {
       this.store.setActionState(a, this.store.maxActionSeq(a), 'unknown', undefined, JSON.stringify({ reason: 'host_crash' }));
@@ -756,11 +839,26 @@ export class Runtime {
     if (unresolved.length > 0) {
       this.store.kvSet(`isolation:${this.profileKey()}`, JSON.stringify({ taskId: unresolved[0].taskId, at: Date.now(), reason: 'host_crash' }));
     }
+    let recovered = 0;
+    let expired = 0;
     for (const row of this.store.listStale(['queued', 'running', 'cancelling', 'paused'])) {
       const deadlinePassed = row.deadlineAt !== null && this.clock.now() > row.deadlineAt;
-      const target = recoverStale(row.status as TaskStatus, deadlinePassed);
+      if (row.status === 'cancelling') {
+        // 遗留 cancelling 按原 stopReason 收尾（DESIGN §8.2）
+        const stopReason = row.errorJson ? (JSON.parse(row.errorJson) as { stopReason?: 'user_cancel' | 'deadline' | 'budget' | 'error' }).stopReason : undefined;
+        const target = resolveCancelling(stopReason ?? 'user_cancel');
+        this.store.transition(row.taskId, row.revision, { status: target, pauseReason: null });
+        recovered += 1;
+        continue;
+      }
+      if (deadlinePassed) {
+        this.store.transition(row.taskId, row.revision, { status: 'expired', pauseReason: null });
+        expired += 1;
+        continue;
+      }
+      const target = recoverStale(row.status as TaskStatus, false);
       if (target.status !== row.status || target.pauseReason) {
-        this.store.transition(taskId0(row), row.revision, {
+        this.store.transition(row.taskId, row.revision, {
           status: target.status,
           pauseReason: target.pauseReason ?? row.pauseReason,
         });
@@ -768,13 +866,40 @@ export class Runtime {
       }
     }
     for (const s of this.store.listSessionsByStatus('ready')) {
-      // 会话页面绑定随宿主进程丢失
+      // 会话页面绑定随宿主进程丢失；恢复时由 resume 重绑
       this.store.upsertSession({ ...s, status: 'disconnected' });
     }
-    return { recovered, isolated: unresolved.length > 0 };
+    return { recovered, expired, isolated: unresolved.length > 0 };
+  }
+
+  /** paused 超过 pauseTtl（或绝对 deadline）→ expired；预约一并释放（DESIGN §6.4）。 */
+  reapExpired(): number {
+    const now = this.clock.now();
+    const pk = this.profileKey();
+    let n = 0;
+    for (const row of this.store.listStale(['paused', 'queued'])) {
+      const pauseOvertime = now - row.updatedAt > this.cfg.runtime.pauseTtlMs;
+      const deadlinePassed = row.deadlineAt !== null && now > row.deadlineAt;
+      if (!pauseOvertime && !deadlinePassed) continue;
+      const fresh = this.store.getTask(row.taskId);
+      if (!fresh || fresh.status !== row.status) continue;
+      this.store.transition(row.taskId, fresh.revision, {
+        status: 'expired',
+        pauseReason: null,
+        errorJson: JSON.stringify({ code: 'BUDGET_EXCEEDED', message: deadlinePassed ? '超过任务绝对有效期' : '暂停超过 pauseTtl，任务过期', retryable: false }),
+      });
+      const reserve = this.store.kvGet(`reserve:${pk}`);
+      if (reserve && JSON.parse(reserve).taskId === row.taskId) {
+        this.store.kvDel(`reserve:${pk}`);
+      }
+      this.resolveWaiter(row.taskId);
+      n += 1;
+    }
+    return n;
   }
 
   async close(): Promise<void> {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.browser) {
       await this.browser.port.close().catch(() => undefined);
       this.browser = null;
@@ -800,17 +925,30 @@ export class Runtime {
 
   private requirePage(sessionId: string): PagePort {
     const page = this.sessionPages.get(sessionId);
-    if (!page) throw err('SESSION_NOT_READY', '会话没有可用页面（重启/断开后需重新 select-page 并 resume）');
-    const closed = (page as unknown as { isClosed?: () => boolean }).isClosed?.() ?? false;
-    if (closed) throw err('SESSION_NOT_READY', '会话页面已关闭，需重新 select-page 并 resume');
+    if (!page) throw new PauseSignal('needs_input', '会话没有可用页面（重启/断开后需重新 select-page 并 resume）');
+    if (page.isClosed()) throw new PauseSignal('needs_input', '会话页面已关闭（被人工关闭或崩溃），需重新 select-page 并 resume');
     return page;
   }
 
-  private transitionTo(row: TaskRow, status: TaskStatus, patch: { error?: { code: string; message: string; retryable?: boolean }; errorJsonRaw?: string; resultsJson?: string; metricsJson?: string; pauseReason?: string; goalJson?: string; varsJson?: string; cursor?: number } = {}, pauseReason?: PauseReason): boolean {
+  private transitionTo(row: TaskRow, status: TaskStatus, patch: { error?: { code: string; message: string; retryable?: boolean }; errorJsonRaw?: string | null; resultsJson?: string; metricsJson?: string; pauseReason?: string; goalJson?: string; varsJson?: string; cursor?: number } = {}, pauseReason?: PauseReason): boolean {
+    try {
+      assertTransition(row.status as TaskStatus, status);
+    } catch {
+      // revision 已被并发操作推进：重新读取后再试一次
+      const fresh = this.store.getTask(row.taskId);
+      if (!fresh || !canTransitionSafe(fresh.status as TaskStatus, status)) return false;
+      row = fresh;
+    }
+    const clearError = ['queued', 'running', 'done', 'cancelled', 'cancelling'].includes(status);
+    const errorJson = patch.errorJsonRaw !== undefined
+      ? patch.errorJsonRaw
+      : patch.error
+        ? JSON.stringify(patch.error)
+        : clearError ? null : row.errorJson;
     const ok = this.store.transition(row.taskId, row.revision, {
       status,
       pauseReason: status === 'paused' ? pauseReason ?? row.pauseReason : null,
-      errorJson: patch.errorJsonRaw ?? (patch.error ? JSON.stringify(patch.error) : row.errorJson),
+      errorJson,
       resultsJson: patch.resultsJson,
       metricsJson: patch.metricsJson,
       goalJson: patch.goalJson,
@@ -831,7 +969,18 @@ export class Runtime {
   }
 
   envelope(row: TaskRow): TaskEnvelope {
-    const error = row.errorJson ? (JSON.parse(row.errorJson) as TaskEnvelope['error'] & { pendingApproval?: PendingApproval }) : undefined;
+    const parsedError = row.errorJson
+      ? (JSON.parse(row.errorJson) as { code: string; message: string; retryable?: boolean; pendingApproval?: PendingApproval; stopReason?: string })
+      : undefined;
+    const error: TaskEnvelope['error'] = parsedError && parsedError.code !== 'CANCEL_PENDING'
+      ? { code: parsedError.code as ErrorCode, message: parsedError.message, retryable: parsedError.retryable ?? false }
+      : undefined;
+    let artifacts: ArtifactMeta[] = [];
+    try {
+      artifacts = this.store.listArtifactsByTask(row.taskId).map(({ artifactId, filename, size, sha256: hash }) => ({ artifactId, filename, size, sha256: hash }));
+    } catch {
+      artifacts = [];
+    }
     const env: TaskEnvelope = {
       schemaVersion: SCHEMA_VERSION,
       taskId: row.taskId,
@@ -840,27 +989,74 @@ export class Runtime {
       revision: row.revision,
       status: row.status as TaskStatus,
       pauseReason: (row.pauseReason as TaskEnvelope['pauseReason']) ?? undefined,
-      stepResults: JSON.parse(row.resultsJson) as StepResult[],
-      metrics: JSON.parse(row.metricsJson),
-      artifacts: this.store.listArtifactsByTask(row.taskId).map(({ artifactId, filename, size, sha256: hash }) => ({ artifactId, filename, size, sha256: hash })),
-      error: error ? { code: error.code, message: error.message, retryable: error.retryable ?? false } : undefined,
-      pendingApproval: error?.pendingApproval,
-      goalVerification: row.goalJson ? (JSON.parse(row.goalJson) as TaskEnvelope['goalVerification']) : undefined,
+      stepResults: safeParse(row.resultsJson, [] as StepResult[]),
+      metrics: safeParse(row.metricsJson, { queuedMs: 0, runningMs: 0, actions: 0, jevRequests: 0, plannerRequests: 0 }),
+      artifacts,
+      error,
+      pendingApproval: parsedError?.pendingApproval,
+      goalVerification: row.goalJson ? safeParse(row.goalJson, undefined as unknown as TaskEnvelope['goalVerification']) : undefined,
     };
     return env;
   }
 }
 
-function taskId0(row: TaskRow): string {
-  return row.taskId;
-}
+// ---------------------------------------------------------------------------
+// 模块级工具
+// ---------------------------------------------------------------------------
 
-function revArg(step: unknown): unknown {
-  return step;
+function canTransitionSafe(from: TaskStatus, to: TaskStatus): boolean {
+  try {
+    assertTransition(from, to);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isTerminalStatus(s: string): boolean {
   return ['done', 'failed', 'expired', 'cancelled'].includes(s);
+}
+
+function pauseErrorCode(reason: PauseReason): string {
+  switch (reason) {
+    case 'needs_confirmation':
+      return 'NEEDS_CONFIRMATION';
+    case 'likely_done':
+      return 'POLICY_BLOCKED';
+    default:
+      return 'NEEDS_INPUT';
+  }
+}
+
+/** 纯只读请求（隔离期间允许执行，不产生新副作用）。 */
+function isReadOnlyRequest(row: TaskRow): boolean {
+  try {
+    const req = JSON.parse(row.requestJson) as { steps?: FlowStep[] };
+    const steps = req.steps ?? [];
+    return steps.length > 0 && steps.every((s) =>
+      s.kind === 'assert' || s.kind === 'extract' ||
+      (s.kind === 'action' && !WRITE_ACTIONS.has(s.action)),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function redactForEvidence(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}${u.pathname}`;
+  } catch {
+    return '(unparsable)';
+  }
+}
+
+function safeParse<T>(json: string, fallback: T): T {
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 function newId(prefix: string): string {
@@ -886,12 +1082,10 @@ function guessPageId(context: import('./ports.js').ContextPort, page: PagePort):
 }
 
 function validateOrigins(allowed: string[], model: string[]): void {
-  const re = /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i;
+  const re = /^https?:\/\/[a-z0-9.-]+(?::\d+)?$/i;
   for (const o of allowed) if (!re.test(o)) throw err('INVALID_INPUT', `allowedOrigins 非法: ${o}`);
   for (const o of model) if (!allowed.includes(o)) throw err('INVALID_INPUT', `modelOrigins 必须是 allowedOrigins 子集: ${o}`);
 }
-
-const WRITE_ACTIONS = new Set(['navigate', 'click', 'fill', 'select', 'press']);
 
 /** execute 输入校验：白名单 + 写操作必须提供后置条件（DESIGN §8.1）。 */
 export function validateExecuteSteps(steps: FlowStep[]): void {
@@ -916,7 +1110,7 @@ export function resolveValues(values: Record<string, ValueInput>): Record<string
     if (typeof v === 'object' && v !== null && 'secretRef' in v) {
       const name = (v as { secretRef: string }).secretRef.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
       const secret = process.env[`JEV_BROWSER_SECRET_${name}`];
-      if (!secret) throw new PauseSignal('needs_input', `缺少 secret "${v.secretRef}"（环境变量 JEV_BROWSER_SECRET_${name}）`);
+      if (!secret) throw new PauseSignal('needs_input', `缺少 secret "${(v as { secretRef: string }).secretRef}"（环境变量 JEV_BROWSER_SECRET_${name}）`);
       out[k] = secret;
     } else {
       out[k] = v;

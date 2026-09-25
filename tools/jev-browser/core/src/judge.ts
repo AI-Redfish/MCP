@@ -22,6 +22,10 @@ export interface RoundDecision {
   valueKey: string | null;
   /** 交付给审计的证据：分项概率。 */
   probabilities: Record<string, unknown>;
+  /** 本轮实际发给模型的候选（targetIndex 对应此数组的下标，非全量 observation）。 */
+  candidates: PageObservation['elements'];
+  /** 服务实际返回的模型标识（DESIGN §11：记录模型实际版本）。 */
+  model?: string;
 }
 
 export interface RoundObservationInput {
@@ -167,7 +171,7 @@ export class TypeSafeJudge implements JudgePort {
       truncated: input.observation.truncated,
     };
     this.stats.jevRequests += 1;
-    // ObservedElement 是纯 JSON 值；这里序列化以满足 SDK 的 JsonValue 约束
+    // ObservedElement 是纯 JSON 值；序列化以满足 SDK 的 EntryType（JsonValue）约束
     const result = await client.systemOne({ state: JSON.parse(JSON.stringify(state)) as EntryType, model: this.cfg.model, questions });
     this.stats.inputTokens += result.usage?.input_tokens ?? 0;
     this.stats.outputTokens += result.usage?.output_tokens ?? 0;
@@ -183,12 +187,14 @@ export class TypeSafeJudge implements JudgePort {
       blocked: Number(a.blocked?.noul ?? 0),
       error: Number(a.error?.noul ?? 0),
       action,
-      targetIndex: Number.isFinite(targetIndex) ? targetIndex : null,
+      targetIndex: Number.isFinite(targetIndex) && targetIndex !== null ? targetIndex : null,
       valueKey: valueKey === 'none' ? null : valueKey,
       probabilities: {
         target: a.target?.probabilities ?? {},
         tool: a.tool?.probabilities ?? {},
       },
+      candidates,
+      model: result.model,
     };
   }
 

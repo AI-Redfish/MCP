@@ -1,17 +1,287 @@
-import { chromium } from 'playwright';
-import path from 'node:path';
+import { chromium, type Browser as PwBrowser, type BrowserContext as PwContext, type Dialog as PwDialog, type Download as PwDownload, type Locator as PwLocator, type Page as PwPage } from 'playwright';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { JevBrowserConfig } from './config.js';
 import { err } from './errors.js';
-import type { BrowserConnector, BrowserPort, ConnectResult, ContextPort, DialogPort, PagePort } from './ports.js';
+import type { BrowserConnector, BrowserPort, ConnectResult, ContextPort, DialogPort, DownloadPort, LocatorPort, PagePort } from './ports.js';
+import { redactUrl } from './ports.js';
+import type { LocatorSpec } from './types.js';
 
 /**
- * Playwright 连接器（DESIGN §4）：attach 借用日常 Chrome，launch 拥有独立实例。
- * 边界处用 cast 接入端口接口；生命周期约束：
- *  - attach: 绝不 newContext / 绝不 close 借用 context；browser.close() 仅断开 CDP 连接
- *    （Playwright 语义：清理“本连接创建的” context 并断开；P0 需端到端复核，DESIGN §4.3 [S5]）。
- *  - launch: 每个 engine 使用独立 profile 目录；实例可由工具关闭。
+ * Playwright 连接器与端口适配层（DESIGN §4）。
+ *
+ * 边界适配：core 其余部分只依赖 ports.ts 的结构接口；这里是唯一出现
+ * playwright 类型的地方。生命周期约束：
+ *  - attach：借用日常 Chrome。绝不 newContext、绝不 close 借用 context；
+ *    browser.close() 仅断开 CDP 连接（是否保留浏览器进程/页面是 P0 端到端
+ *    复核项，DESIGN §4.3 [S5]，不依据方法名断言）。
+ *  - launch：工具拥有的实例，每个 engine 独立 profile 目录，可以安全关闭。
  */
+
+// ---------------------------------------------------------------------------
+// Playwright → 端口适配器（无状态薄包装）
+// ---------------------------------------------------------------------------
+
+class PwLocatorAdapter implements LocatorPort {
+  constructor(private readonly loc: PwLocator) {}
+
+  count(): Promise<number> {
+    return this.loc.count();
+  }
+
+  first(): LocatorPort {
+    return new PwLocatorAdapter(this.loc.first());
+  }
+
+  click(opts?: { timeout?: number }): Promise<void> {
+    return this.loc.click(opts);
+  }
+
+  fill(value: string, opts?: { timeout?: number }): Promise<void> {
+    return this.loc.fill(value, opts);
+  }
+
+  press(key: string, opts?: { timeout?: number }): Promise<void> {
+    return this.loc.press(key, opts);
+  }
+
+  selectOption(value: string, opts?: { timeout?: number }): Promise<void> {
+    // Playwright 返回选中的值数组；端口语义只要成功/失败
+    return this.loc.selectOption(value, opts).then(() => undefined);
+  }
+
+  isVisible(): Promise<boolean> {
+    return this.loc.isVisible();
+  }
+
+  innerText(opts?: { timeout?: number }): Promise<string> {
+    return this.loc.innerText(opts);
+  }
+
+  waitFor(state: 'visible' | 'hidden' | 'attached', opts?: { timeout?: number }): Promise<void> {
+    // Playwright 的 waitFor 是单 options 对象：{ state, timeout }
+    return this.loc.waitFor({ state, timeout: opts?.timeout });
+  }
+}
+
+class PwDialogAdapter implements DialogPort {
+  constructor(private readonly d: PwDialog) {}
+
+  type(): string {
+    return this.d.type();
+  }
+
+  message(): string {
+    return this.d.message();
+  }
+
+  accept(text?: string): Promise<void> {
+    return this.d.accept(text);
+  }
+
+  dismiss(): Promise<void> {
+    return this.d.dismiss();
+  }
+}
+
+class PwDownloadAdapter implements DownloadPort {
+  constructor(private readonly dl: PwDownload) {}
+
+  saveAs(p: string): Promise<void> {
+    return this.dl.saveAs(p);
+  }
+
+  failure(): Promise<string | null> {
+    return this.dl.failure();
+  }
+
+  suggestedFilename(): string {
+    return this.dl.suggestedFilename();
+  }
+}
+
+export class PwPageAdapter implements PagePort {
+  constructor(private readonly page: PwPage) {}
+
+  url(): string {
+    return this.page.url();
+  }
+
+  isClosed(): boolean {
+    return this.page.isClosed();
+  }
+
+  title(): Promise<string> {
+    return this.page.title();
+  }
+
+  goto(url: string, opts?: { timeout?: number; waitUntil?: 'load' | 'domcontentloaded' }): Promise<unknown> {
+    return this.page.goto(url, opts);
+  }
+
+  locator(spec: LocatorSpec): LocatorPort {
+    return new PwLocatorAdapter(pwLocatorOf(this.page, spec));
+  }
+
+  evaluate<T = unknown>(script: string): Promise<T> {
+    // Playwright 接受字符串表达式；观察脚本是内置固定实现（DESIGN §6.2）。
+    return this.page.evaluate(script) as Promise<T>;
+  }
+
+  keyboardPress(key: string): Promise<void> {
+    // keyboard.press 是即时操作，无 actionability timeout 可传
+    return this.page.keyboard.press(key);
+  }
+
+  mouseWheel(dx: number, dy: number): Promise<void> {
+    return this.page.mouse.wheel(dx, dy);
+  }
+
+  screenshot(opts?: { path?: string; fullPage?: boolean }): Promise<Buffer> {
+    return this.page.screenshot(opts) as Promise<Buffer>;
+  }
+
+  waitForTimeout(ms: number): Promise<void> {
+    return this.page.waitForTimeout(ms);
+  }
+
+  waitForDownload(opts?: { timeout?: number }): Promise<DownloadPort> {
+    // 先注册 download 事件等待再由调用方触发动作（DESIGN §10 下载正确性）
+    return this.page.waitForEvent('download', opts).then((d) => new PwDownloadAdapter(d));
+  }
+
+  onDialog(handler: (dialog: DialogPort) => void): void {
+    this.page.on('dialog', (d) => void handler(new PwDialogAdapter(d)));
+  }
+
+  /** 调试/doctor 用：返回原始 Page（本模块外不得使用其副作用方法）。 */
+  raw(): PwPage {
+    return this.page;
+  }
+}
+
+class PwContextAdapter implements ContextPort {
+  constructor(private readonly ctx: PwContext) {}
+
+  pages(): PagePort[] {
+    return this.ctx.pages().filter((p) => !p.isClosed()).map((p) => new PwPageAdapter(p));
+  }
+
+  async newPage(url?: string): Promise<PagePort> {
+    // BrowserContext.newPage() 无 url 参数（与 Browser.newPage 不同）：建页后再导航
+    const page = await this.ctx.newPage();
+    if (url) await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => undefined);
+    return new PwPageAdapter(page);
+  }
+
+  onPage(handler: (page: PagePort) => void): void {
+    this.ctx.on('page', (p) => void handler(new PwPageAdapter(p)));
+  }
+}
+
+class PwBrowserAdapter implements BrowserPort {
+  constructor(private readonly browser: PwBrowser) {}
+
+  contexts(): ContextPort[] {
+    return this.browser.contexts().map((c) => new PwContextAdapter(c));
+  }
+
+  close(): Promise<void> {
+    // attach：断开 CDP 连接；launch（persistent context 经 wrapper）：关闭实例。
+    return this.browser.close();
+  }
+}
+
+/** 白名单定位器映射（DESIGN §8.1）：优先 role/label/testId，css 为显式备用。 */
+function pwLocatorOf(page: PwPage, spec: LocatorSpec): PwLocator {
+  switch (spec.by) {
+    case 'role':
+      return page.getByRole(spec.role as never, { name: spec.name, exact: spec.exact ?? undefined });
+    case 'label':
+      return page.getByLabel(spec.name, { exact: spec.exact ?? undefined });
+    case 'testId':
+      return page.getByTestId(spec.id);
+    case 'text':
+      return page.getByText(spec.text, { exact: spec.exact ?? undefined });
+    case 'css':
+      return page.locator(spec.selector);
+    default: {
+      const never: never = spec;
+      throw err('INVALID_INPUT', `未知定位器: ${JSON.stringify(never)}`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// attach 端点解析：'chrome' 哨兵 / 显式 loopback URL / DevToolsActivePort 发现
+// ---------------------------------------------------------------------------
+
+const LOOPBACK_RE = /^(localhost|127\.0\.0\.1|\[::1\]|::1)$/i;
+
+/**
+ * 解析 attach 端点（DESIGN §4.1）：
+ *  - 显式 http(s)/ws(s) URL：仅接受 loopback，禁止由页面/模型提供的地址；
+ *  - 'chrome'（默认）：先尝试 Playwright channel 语义；失败后从默认用户数据
+ *    目录的 DevToolsActivePort 文件构造 http://127.0.0.1:<port>（与 Playwright
+ *    固定版本的 channel 发现思路一致，不 import 私有模块 [S5]）。
+ *    未验证前该路径保持候选状态，由 P0 实测定案。
+ */
+export function resolveAttachEndpoint(endpoint: string): string {
+  if (!endpoint || endpoint === 'chrome') return 'chrome';
+  if (/^(https?|wss?):\/\//i.test(endpoint)) {
+    let u: URL;
+    try {
+      u = new URL(endpoint);
+    } catch {
+      throw err('CONFIG_INVALID', `CDP endpoint 不是合法 URL: ${endpoint}`);
+    }
+    const host = u.hostname;
+    if (!LOOPBACK_RE.test(host)) {
+      throw err('CONFIG_INVALID', `CDP endpoint 只允许 loopback（防远程接管，DESIGN §4.1）: ${host}`);
+    }
+    return endpoint.replace(/^http/, 'http'); // 保持原样（Playwright 接受 http:// 调试端点）
+  }
+  throw err('CONFIG_INVALID', `browser.attach.endpoint 只支持 "chrome" 或 loopback URL: ${endpoint}`);
+}
+
+/** 常见平台的 Chrome 默认用户数据目录（仅读取 DevToolsActivePort，不读浏览历史）。 */
+function chromeUserDataDirs(): string[] {
+  const home = os.homedir();
+  switch (process.platform) {
+    case 'win32': {
+      const base = process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local');
+      return [path.join(base, 'Google', 'Chrome', 'User Data')];
+    }
+    case 'darwin':
+      return [path.join(home, 'Library', 'Application Support', 'Google', 'Chrome')];
+    default:
+      return [
+        path.join(home, '.config', 'google-chrome'),
+        path.join(home, '.config', 'google-chrome-beta'),
+      ];
+  }
+}
+
+/** 从 DevToolsActivePort 文件读取本机回环端口；找不到/不可读返回 undefined。 */
+export function discoverChromeLoopbackEndpoint(): string | undefined {
+  for (const dir of chromeUserDataDirs()) {
+    try {
+      const raw = fs.readFileSync(path.join(dir, 'DevToolsActivePort'), 'utf8');
+      const port = Number(raw.split(/\r?\n/)[0]?.trim());
+      if (Number.isInteger(port) && port > 0 && port < 65536) {
+        return `http://127.0.0.1:${port}`;
+      }
+    } catch {
+      // 下一个候选目录
+    }
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 连接器
+// ---------------------------------------------------------------------------
 
 export class PlaywrightConnector implements BrowserConnector {
   constructor(private readonly cfg: JevBrowserConfig) {}
@@ -19,21 +289,26 @@ export class PlaywrightConnector implements BrowserConnector {
   async connect(): Promise<ConnectResult> {
     const b = this.cfg.browser;
     if (b.mode === 'attach') {
-      // endpoint 'chrome' 走 channel 发现（DevToolsActivePort），显式 URL 直接连接（DESIGN §4.1）
-      const endpoint = b.attach.endpoint;
-      try {
-        const browser = await chromium.connectOverCDP(endpoint, {
-          noDefaults: b.attach.noDefaults,
-          timeout: b.attach.timeoutMs,
-        });
-        return { browser: browser as unknown as BrowserPort, ownership: 'borrowed', kind: 'attach' };
-      } catch (e) {
-        const msg = (e as Error).message.split('\n')[0].slice(0, 200);
-        throw err('BROWSER_BUSY', `接管 Chrome 失败（需在 chrome://inspect/#remote-debugging 开启授权，Chrome ≥ 144）：${msg}`, {
-          details: { endpoint },
-        });
+      const requested = resolveAttachEndpoint(b.attach.endpoint);
+      const attempts = requested === 'chrome' ? ['chrome', discoverChromeLoopbackEndpoint() ?? undefined] : [requested];
+      let lastError: unknown;
+      for (const endpoint of attempts) {
+        if (!endpoint) continue;
+        try {
+          const browser = endpoint === 'chrome'
+            ? await chromium.connectOverCDP('chrome', { noDefaults: b.attach.noDefaults, timeout: b.attach.timeoutMs })
+            : await chromium.connectOverCDP(endpoint, { timeout: b.attach.timeoutMs });
+          return { browser: new PwBrowserAdapter(browser), ownership: 'borrowed', kind: 'attach' };
+        } catch (e) {
+          lastError = e;
+        }
       }
+      const msg = (lastError as Error | undefined)?.message.split('\n')[0].slice(0, 200) ?? '未知错误';
+      throw err('BROWSER_BUSY',
+        `接管 Chrome 失败（需在 chrome://inspect/#remote-debugging 开启授权，Chrome ≥ 144，或提供已授权的 loopback endpoint）：${msg}`,
+        { details: { endpoint: requested } });
     }
+
     // launch：本机 Chrome（channel）或 Playwright 管理的 Chromium；独立 profile 目录
     const userDataDir = b.launch.userDataDir ?? path.join(this.cfg.runtime.dataDir, 'profiles', b.engine, 'default');
     fs.mkdirSync(userDataDir, { recursive: true });
@@ -44,7 +319,7 @@ export class PlaywrightConnector implements BrowserConnector {
         timeout: b.launch.timeoutMs,
         channel: b.engine === 'chrome' ? 'chrome' : undefined,
       });
-      const context = ctx as unknown as ContextPort;
+      const context = new PwContextAdapter(ctx);
       const wrapper: BrowserPort = {
         contexts: () => [context],
         close: () => ctx.close(),
@@ -55,10 +330,17 @@ export class PlaywrightConnector implements BrowserConnector {
       if (/Executable doesn't exist/i.test(msg)) {
         throw err('CAPABILITY_UNSUPPORTED', 'Playwright 管理的 Chromium 未安装。显式执行: npx playwright install chromium');
       }
+      if (/ProcessSingleton|Failed to create|SingletonLock/i.test(msg)) {
+        throw err('BROWSER_BUSY', `启动失败：profile 目录可能已被占用（另一个 Chrome 实例正在使用）: ${userDataDir}`);
+      }
       throw err('BROWSER_BUSY', `启动浏览器失败: ${msg}`);
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// 页面选择
+// ---------------------------------------------------------------------------
 
 /** 会话页面选择（DESIGN §4.1/§8.1）：单页自动选定；多页不猜，返回候选。 */
 export interface PageSelection {
@@ -67,8 +349,8 @@ export interface PageSelection {
 }
 
 export async function selectPage(context: ContextPort, pageId?: string): Promise<PageSelection> {
-  const pages = context.pages().filter((p) => !isClosedSafe(p));
-  const candidates = [] as PageSelection['candidates'];
+  const pages = context.pages();
+  const candidates: PageSelection['candidates'] = [];
   for (let i = 0; i < pages.length; i++) {
     let title = '';
     try {
@@ -76,12 +358,12 @@ export async function selectPage(context: ContextPort, pageId?: string): Promise
     } catch {
       title = '';
     }
-    candidates.push({ pageId: `p${i}`, title: title.slice(0, 80), url: redact(pages[i].url()) });
+    candidates.push({ pageId: `p${i}`, title: title.slice(0, 80), url: redactUrl(pages[i].url()) });
   }
   if (pageId !== undefined) {
     const idx = Number(pageId.replace(/^p/, ''));
     if (!Number.isInteger(idx) || idx < 0 || idx >= pages.length) {
-      throw err('PAGE_NOT_RESOLVED', `pageId 不存在: ${pageId}`, { details: { candidates } });
+      throw err('PAGE_NOT_RESOLVED', `pageId 不存在（标签页可能已被关闭，请重新 browser_pages）: ${pageId}`, { details: { candidates } });
     }
     return { page: pages[idx], candidates };
   }
@@ -89,27 +371,13 @@ export async function selectPage(context: ContextPort, pageId?: string): Promise
   return { page: null, candidates };
 }
 
-function isClosedSafe(p: PagePort): boolean {
-  try {
-    return (p as unknown as { isClosed(): boolean }).isClosed();
-  } catch {
-    return false;
-  }
-}
-
-function redact(url: string): string {
-  try {
-    const u = new URL(url);
-    return `${u.protocol}//${u.host}${u.pathname}`;
-  } catch {
-    return '(unparsable)';
-  }
-}
-
 /**
  * Dialog 控制器（DESIGN §4.4）：
- *  - 已接管页安装 handler 后由本工具决策（默认保守 dismiss 并记录）；
- *  - 未接管页不安装 handler——行为由 Playwright/CDP 决定，P0 验证项，不在代码里承诺。
+ *  - 已接管页安装 handler 后由本工具决策；默认保守 dismiss 并记录，
+ *    不替用户对未知对话框作选择；
+ *  - 未接管页不安装 handler（其行为属 Playwright/CDP 层，是 P0 非干扰验证项，
+ *    不在代码里承诺）；
+ *  - 已授权的预期 confirm 才允许接受，且一次性消费。
  */
 export class DialogManager {
   private policies = new WeakMap<object, { accept: boolean; reason: string }>();
@@ -137,7 +405,7 @@ export class DialogManager {
     });
   }
 
-  /** 动作前武装：已授权的预期 confirm 才允许接受（DESIGN §4.4）。 */
+  /** 动作前武装：已授权的预期 confirm 才允许接受（一次性，DESIGN §4.4）。 */
   armOnce(page: PagePort, reason: string): void {
     this.install(page);
     this.policies.set(page as unknown as object, { accept: true, reason });

@@ -72,8 +72,16 @@ export class ApiClient {
     return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/act`, input);
   }
 
+  snapshot(sessionId: string, forModel?: boolean): Promise<unknown> {
+    return this.call('POST', `/v1/sessions/${encodeURIComponent(sessionId)}/snapshot`, { forModel: forModel ?? false });
+  }
+
   getTask(taskId: string): Promise<{ envelope: TaskEnvelope }> {
     return this.call('GET', `/v1/tasks/${encodeURIComponent(taskId)}`);
+  }
+
+  listArtifacts(taskId: string): Promise<{ artifacts: Array<{ artifactId: string; filename: string; size: number; sha256: string }> }> {
+    return this.call('GET', `/v1/tasks/${encodeURIComponent(taskId)}/artifacts`);
   }
 
   cancelTask(taskId: string, input: unknown): Promise<{ envelope: TaskEnvelope }> {

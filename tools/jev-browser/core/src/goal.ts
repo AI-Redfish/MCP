@@ -23,6 +23,9 @@ export interface GoalLoopOptions {
   allowedOrigins: string[];
   maxActions: number;
   maxJevRequests: number;
+  /** 两类模型累计 token 上限（DESIGN §6.4）；undefined = 用配置默认。 */
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
   actionTimeoutMs: number;
   /** 阈值来自 config.jev（dev 初值，须按业务校准，DESIGN §6.3）。 */
   thresholds: { doneAt: number; confirmLow: number; confirmHigh: number };
@@ -30,8 +33,8 @@ export interface GoalLoopOptions {
   ledger: LedgerHook;
   cancelFlag: { cancelled: boolean };
   dialogs?: DialogManager;
-  /** 派发高危动作前回调：返回是否已获授权（未授权则暂停，DESIGN §10）。 */
-  requestApproval?: (step: ActionStep, actionRevision: number) => Promise<boolean>;
+  /** 派发前的策略闸门：未授权抛 PauseSignal(needs_confirmation)（DESIGN §10）。 */
+  requestApproval?: (step: ActionStep, actionRevision: number) => Promise<void>;
   nextActionRevision(): number;
 }
 
@@ -57,14 +60,17 @@ export class GoalExecutor {
         throw err('BUDGET_EXCEEDED', `Jev 请求数超过预算 ${this.opts.maxJevRequests}`);
       }
       rounds += 1;
+      if (judge.usage().inputTokens + judge.usage().outputTokens > (this.opts.maxInputTokens ?? Number.MAX_SAFE_INTEGER) + (this.opts.maxOutputTokens ?? Number.MAX_SAFE_INTEGER)) {
+        throw err('BUDGET_EXCEEDED', '模型 token 累计超过预算');
+      }
       await waitForSettle(this.page, 8000);
       const obs = await observePage(this.page, { allowedOrigins: this.opts.allowedOrigins });
       const diff = diffObservation(prev, obs);
       prev = obs;
 
-      // 云模型外发域检查（DESIGN §10：modelOrigins）
-      if (this.opts.modelOrigins.length > 0 && !this.opts.modelOrigins.includes(originOf(obs.url))) {
-        throw new PauseSignal('needs_input', `当前页 origin 不在 modelOrigins 内，禁止云模型外发: ${originOf(obs.url)}`);
+      // 云模型外发域检查（DESIGN §10：modelOrigins 为空 = 默认禁止外发）
+      if (!this.opts.modelOrigins.includes(originOf(obs.url))) {
+        throw new PauseSignal('needs_input', `当前页 origin 不在 modelOrigins 内，禁止云模型外发（空列表 = 全部禁止）: ${originOf(obs.url)}`);
       }
 
       const decision = await judge.decideRound({
@@ -107,7 +113,8 @@ export class GoalExecutor {
       if (decision.action === 'none' || decision.targetIndex === null) {
         throw new PauseSignal('ambiguous', `Jev 无法选出下一步（action=${decision.action}）`);
       }
-      const candidate = obs.elements[decision.targetIndex];
+      // targetIndex 对应本轮实际发送给模型的候选切片（修复切片后索引错位）
+      const candidate = decision.candidates[decision.targetIndex];
       if (!candidate) throw new PauseSignal('ambiguous', '目标候选过期（快照漂移），需重新观察');
 
       const target = locatorFromCandidate(candidate);
@@ -130,10 +137,13 @@ export class GoalExecutor {
         }
       }
 
-      // PolicyGate 在 TaskService 层注入（performPolicy）；此处仅执行已过闸动作
+      // PolicyGate 在 TaskService 层注入；未授权抛 PauseSignal，动作不派发（DESIGN §10）。
+      // 注意：策略批准 ≠ 对话框自动接受授权（DESIGN §4.4 的边界不得混淆）。
       const actionRevision = this.opts.nextActionRevision();
-      const approved = this.opts.requestApproval ? await this.opts.requestApproval(step, actionRevision) : true;
-      const result = await performAction(this.page, step, {
+      if (this.opts.requestApproval) {
+        await this.opts.requestApproval(step, actionRevision);
+      }
+      await performAction(this.page, step, {
         vars: {} as Record<string, unknown>,
         values: this.opts.values,
         artifacts: this.opts.artifacts,
@@ -142,14 +152,8 @@ export class GoalExecutor {
         actionTimeoutMs: this.opts.actionTimeoutMs,
         cancelFlag: this.opts.cancelFlag,
         dialogs: this.opts.dialogs,
-        acceptDialogOnce: approved,
       });
-      void result;
     }
-  }
-
-  private cfg() {
-    return this.opts.thresholds;
   }
 }
 

@@ -64,15 +64,15 @@ const HELP = `jev-browser-cli —— 浏览器控制（Playwright + Jev；方案
                                               创建会话（origin 默认不许可任何网站）
   pages --session <id>                        列出标签页
   select-page --session <id> --page <id>      选择标签页
-  snapshot --session <id> [--for-model]       只读页面快照
+  snapshot --session <id> [--for-model]       只读页面快照（for-model 需 origin ∈ modelOrigins）
   execute --file <flow.json> (--url <url> | --page <id>) --origin <origin> [...]
                                               执行确定性步骤（不调用规划模型）
   run --goal <文本> --success <验收条件> (--url | --page) --origin ... [--model-origin ...]
-                                              内部规划并执行（需 planner 配置）
+                                              内部规划并执行（需 planner 与 Jev 配置）
   act --session <id> --step '<ActionStep JSON>' [--values '<json>']
-  task get|cancel|resume|approve <taskId>     [--request-id] [--expected-revision N]
-                                              cancel/resume 需 --request-id；resume 未证实结果需 --rerun-confirm
+  task get|cancel|resume|approve <taskId>     cancel/resume 需 --request-id；resume 未证实结果需 --rerun-confirm
   grant create --task <id> --action-revision <n>   签发审批 grant（需 JEV_BROWSER_APPROVAL_KEY）
+  artifact list --task <id>                   列出任务产物
   artifact get --task <id> --artifact <id> --out <path>
   disconnect --session <id> [--detach-task]
 
@@ -130,6 +130,7 @@ function finish(env: TaskEnvelope, json: boolean): never {
       `status=${env.status}${env.pauseReason ? ` (${env.pauseReason})` : ''} taskId=${env.taskId} revision=${env.revision}`,
     ];
     if (env.error) lines.push(`error: [${env.error.code}] ${env.error.message}`);
+    if (env.goalVerification) lines.push(`goalVerification: ${env.goalVerification.by} ok=${env.goalVerification.ok}${env.goalVerification.detail ? ` (${env.goalVerification.detail})` : ''}`);
     if (env.pendingApproval) {
       lines.push(`待审批: actionRevision=${env.pendingApproval.actionRevision} action=${env.pendingApproval.action} 原因=${env.pendingApproval.reason}`);
       lines.push(`批准方式: grant create --task ${env.taskId} --action-revision ${env.pendingApproval.actionRevision} 然后 task approve ${env.taskId} --grant <token>`);
@@ -161,12 +162,19 @@ async function main(): Promise<void> {
     api = new ApiClient({ baseUrl: apiBase, token });
   }
 
-  const runtimeOf = async (): Promise<Runtime> => {
-    if (api) fail('该命令需连接长驻服务时使用不同的转发路径', 2);
-    const { config } = loadConfig(configOpts);
-    const rt = new Runtime(config);
-    rt.recoverOnStartup();
-    return rt;
+  // 同一进程内复用同一 Runtime 实例（多个实例的 waiter/队列互不可见）
+  let runtimePromise: Promise<Runtime> | null = null;
+  const runtimeOf = (): Promise<Runtime> => {
+    if (!runtimePromise) {
+      runtimePromise = (async () => {
+        if (api) fail('该命令在 --api 模式下走转发路径，不需要本地 Runtime', 2);
+        const { config } = loadConfig(configOpts);
+        const rt = new Runtime(config);
+        rt.recoverOnStartup();
+        return rt;
+      })();
+    }
+    return runtimePromise;
   };
 
   /** 一次性会话：execute/run/snapshot 的快捷方式。 */
@@ -175,6 +183,7 @@ async function main(): Promise<void> {
     const pageId = str(args.flags, 'page');
     const allowed = originsOf(args.flags, 'origin');
     const modelOrigins = originsOf(args.flags, 'model-origin');
+    if (!url && !pageId) fail('需要 --url 或 --page 指定目标标签页');
     const target = url ? { kind: 'new' as const, url } : { kind: 'existing' as const, pageId };
     const s = await rt.createSession(principal, { target, allowedOrigins: allowed, modelOrigins });
     if (s.status === 'awaiting_page') {
@@ -236,11 +245,18 @@ async function main(): Promise<void> {
 
     case 'snapshot': {
       const sessionId = str(args.flags, 'session');
+      if (api) {
+        if (!sessionId) fail('--api 模式需要 --session');
+        const obs = await api.snapshot(sessionId, args.flags['for-model'] === true);
+        console.log(JSON.stringify(obs, null, 2));
+        return;
+      }
       const rt = await runtimeOf();
       const sid = sessionId ?? (await ensureOneShotSession(rt));
       const obs = await rt.snapshot(principal, sid, { forModel: args.flags['for-model'] === true });
       console.log(JSON.stringify(obs, null, 2));
-      if (!sessionId) await rt.disconnect(principal, sid);
+      if (!sessionId) await rt.disconnect(principal, sid).catch(() => undefined);
+      await rt.close();
       return;
     }
 
@@ -253,8 +269,7 @@ async function main(): Promise<void> {
         const sessionId = str(args.flags, 'session');
         if (!sessionId) fail('--api 模式需要 --session（先 connect）');
         const res = await api.execute({ sessionId, ...input }, str(args.flags, 'idempotency-key'));
-        const queued = res as unknown as TaskEnvelope;
-        const env = await pollApi(api, queued.taskId);
+        const env = await pollApi(api, (res as unknown as TaskEnvelope).taskId);
         finish(env, json);
       }
       const rt = await runtimeOf();
@@ -312,27 +327,35 @@ async function main(): Promise<void> {
       const sub = args.positional[0];
       const taskId = args.positional[1] ?? str(args.flags, 'task');
       if (!sub || !taskId) fail('task 需要 get|cancel|resume|approve <taskId>');
+      const rtPromise = api ? null : runtimeOf();
       if (sub === 'get') {
-        const env = api ? (await api.getTask(taskId)).envelope : (await runtimeOf()).getTask(principal, taskId);
+        const env = api ? (await api.getTask(taskId)).envelope : (await rtPromise!).getTask(principal, taskId);
         finish(env, json);
       }
       const requestId = str(args.flags, 'request-id') ?? newIdFromTime();
       const expectedRevision = str(args.flags, 'expected-revision');
       const opts = { requestId, expectedRevision: expectedRevision !== undefined ? Number(expectedRevision) : undefined };
       if (sub === 'cancel') {
-        const env = api ? (await api.cancelTask(taskId, opts)).envelope : await (await runtimeOf()).cancelTask(principal, taskId, opts);
+        const env = api ? (await api.cancelTask(taskId, opts)).envelope : await (await rtPromise!).cancelTask(principal, taskId, opts);
         finish(env, json);
       }
       if (sub === 'resume') {
         const resumeOpts = { ...opts, rerunConfirmed: args.flags['rerun-confirm'] === true };
-        const env = api ? (await api.resumeTask(taskId, resumeOpts)).envelope : await (await runtimeOf()).resumeTask(principal, taskId, resumeOpts);
-        const finalEnv = env.status === 'queued' && !api ? await (await runtimeOf()).waitEnvelope(taskId) : env;
+        if (api) {
+          const env = (await api.resumeTask(taskId, resumeOpts)).envelope;
+          const finalEnv = ['queued', 'running', 'cancelling'].includes(env.status) ? await pollApi(api, taskId) : env;
+          finish(finalEnv, json);
+        }
+        const rt = await rtPromise!;
+        const env = await rt.resumeTask(principal, taskId, resumeOpts);
+        const finalEnv = ['queued', 'running', 'cancelling'].includes(env.status) ? await rt.waitEnvelope(taskId) : env;
+        await rt.close().catch(() => undefined);
         finish(finalEnv, json);
       }
       if (sub === 'approve') {
         const grant = str(args.flags, 'grant');
         if (!grant) fail('approve 需要 --grant <token>（由 grant create 签发）');
-        const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await runtimeOf()).approveTask(principal, taskId, grant);
+        const env = api ? (await api.approveTask(taskId, { grant })).envelope : (await rtPromise!).approveTask(principal, taskId, grant);
         finish(env, json);
       }
       fail(`未知 task 子命令: ${sub}`);
@@ -346,30 +369,42 @@ async function main(): Promise<void> {
       const taskId = str(args.flags, 'task');
       const actionRevision = Number(str(args.flags, 'action-revision'));
       if (!taskId || !Number.isFinite(actionRevision)) fail('grant create 需要 --task 与 --action-revision');
-      const token = signGrant(
-        { grantId: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`, taskId, actionRevision, action: '*', issuedAt: Date.now(), expiresAt: Date.now() + 120_000 },
+      const { config } = loadConfig(configOpts);
+      const ttl = config.safety.approvalTtlMs;
+      const token2 = signGrant(
+        { grantId: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`, taskId, actionRevision, action: '*', issuedAt: Date.now(), expiresAt: Date.now() + ttl },
         key,
       ).signature;
-      if (json) console.log(JSON.stringify({ grant: token }, null, 2));
-      else console.log(token);
+      if (json) console.log(JSON.stringify({ grant: token2, ttlMs: ttl }, null, 2));
+      else console.log(token2);
       return;
     }
 
     case 'artifact': {
-      if (args.positional[0] !== 'get') fail('用法：artifact get --task <id> --artifact <id> --out <path>');
+      const sub = args.positional[0];
       const taskId = str(args.flags, 'task');
-      const artifactId = str(args.flags, 'artifact');
-      const out = str(args.flags, 'out');
-      if (!taskId || !artifactId || !out) fail('artifact get 需要 --task/--artifact/--out');
-      if (api) {
-        await api.saveArtifact(taskId, artifactId, out);
-      } else {
-        const rt = await runtimeOf();
-        const { path: src } = rt.artifactPath(principal, taskId, artifactId);
-        fs.copyFileSync(src, out);
-        await rt.close();
+      if (sub === 'list') {
+        if (!taskId) fail('artifact list 需要 --task');
+        const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await runtimeOf()).listArtifacts(principal, taskId);
+        console.log(JSON.stringify({ taskId, artifacts: arts }, null, 2));
+        return;
       }
-      console.error(`已保存: ${out}`);
+      if (sub === 'get') {
+        const artifactId = str(args.flags, 'artifact');
+        const out = str(args.flags, 'out');
+        if (!taskId || !artifactId || !out) fail('artifact get 需要 --task/--artifact/--out');
+        if (api) {
+          await api.saveArtifact(taskId, artifactId, out);
+        } else {
+          const rt = await runtimeOf();
+          const { path: src } = rt.artifactPath(principal, taskId, artifactId);
+          fs.copyFileSync(src, out);
+          await rt.close();
+        }
+        console.error(`已保存: ${out}`);
+        return;
+      }
+      fail('用法：artifact list|get（见 help）');
       return;
     }
 
@@ -401,7 +436,7 @@ async function pollApi(api: ApiClient, taskId: string): Promise<TaskEnvelope> {
 }
 
 function newIdFromTime(): string {
-  return `r${Date.now().toString(36)}`;
+  return `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
 
 main().catch((e: unknown) => {

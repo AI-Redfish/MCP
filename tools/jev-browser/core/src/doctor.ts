@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig, credentialPresent, redactForDoctor, type LoadConfigOptions } from './config.js';
-import { err } from './errors.js';
 import { PlaywrightConnector } from './connectors.js';
 
 /**
@@ -42,13 +41,18 @@ export async function runDoctor(opts: LoadConfigOptions & { attemptConnect?: boo
     checks.push({ name: 'dataDir', ok: false, detail: `${config.runtime.dataDir}: ${(e as Error).message}` });
   }
 
-  // launch profile 目录占用（粗查 Singlock 文件）
+  // launch profile 目录占用（粗查 Chrome/Chromium 的锁文件；不同平台/版本文件名不同，仅提示性检测）
   if (config.browser.mode === 'launch') {
     const udd = config.browser.launch.userDataDir ?? path.join(config.runtime.dataDir, 'profiles', config.browser.engine, 'default');
-    const lockFile = path.join(udd, 'Singlock');
-    checks.push({ name: 'launchProfile', ok: !fs.existsSync(lockFile), detail: fs.existsSync(lockFile) ? `${udd} 似乎被占用（Singlock 存在）` : udd });
+    const lockNames = ['Singlock', 'SingletonLock', 'SingletonCookie', 'lockfile'];
+    const found = lockNames.filter((n) => fs.existsSync(path.join(udd, n)));
+    checks.push({
+      name: 'launchProfile',
+      ok: found.length === 0,
+      detail: found.length ? `${udd} 似乎被占用（${found.join(',')}）；若确认无实例运行可删除后重试` : udd,
+    });
     if (config.browser.engine === 'chromium') {
-      checks.push({ name: 'chromiumInstall', ok: true, detail: '未自动检查；显式执行 npx playwright install chromium（方案：浏览器下载是显式 setup）' });
+      checks.push({ name: 'chromiumInstall', ok: true, detail: '未自动检查；显式执行 npx playwright install chromium（浏览器下载是显式 setup，DESIGN §3）' });
     }
   }
 
@@ -103,6 +107,5 @@ export async function runDoctor(opts: LoadConfigOptions & { attemptConnect?: boo
     result.connect = { attempted: false, ok: false, detail: '当前 mode 不是 attach；connect 检查只适用于接管模式' };
   }
 
-  void err;
   return result;
 }

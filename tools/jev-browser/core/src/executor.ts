@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ActionStep, ArtifactMeta, ExpectSpec, LocatorSpec } from './types.js';
-import { ActionOutcomeUnknownError, err } from './errors.js';
+import { ActionOutcomeUnknownError, JevError, err } from './errors.js';
 import { resolveLocator, verifyExpects } from './locator.js';
 import type { DialogManager } from './connectors.js';
 import type { Clock, Logger, PagePort } from './ports.js';
@@ -98,6 +98,9 @@ export async function performAction(
   if (ctx.cancelFlag?.cancelled) {
     throw err('POLICY_BLOCKED', '任务已进入取消流程，动作未派发');
   }
+  if (step.action === 'navigate' && resolveValue(step, ctx.values) === undefined) {
+    throw err('INVALID_INPUT', 'navigate 动作需要 value 或 valuesRef 指定目标 URL');
+  }
   ctx.ledger.prepared(step, ctx.actionRevision);
   const timeout = ctx.actionTimeoutMs;
   let downloadPromise: Promise</* DownloadPort */ import('./ports.js').DownloadPort> | undefined;
@@ -186,18 +189,25 @@ export async function performAction(
 
     const verdict = await verifyExpects(page, step.expect, { vars: ctx.vars, lastDownload: { artifactId } }, timeout);
     if (!verdict.ok) {
+      ctx.ledger.finished(step, ctx.actionRevision, 'failed', { reason: 'postcondition', failures: verdict.failures });
       throw err('ACTION_FAILED', `后置条件未通过: ${verdict.failures.map((f) => f.reason).join('; ')}`.slice(0, 300), {
         details: { failures: verdict.failures },
       });
     }
+    // 结果落账：verified/failed/unknown 三态必须收口（DESIGN §9.1）
+    ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url() });
     return { evidence: { url: page.url() }, artifactId };
   } catch (e) {
+    if (e instanceof JevError && e.code === 'ACTION_FAILED' && (e.details as { failures?: unknown } | undefined)?.failures !== undefined) {
+      throw e; // 后置条件失败已在上方落账，直接上抛
+    }
     const isTimeout = /timeout|timed out/i.test((e as Error).message) || (e as { name?: string }).name === 'TimeoutError';
     if (isTimeout) {
       // 超时 ≠ 未执行：先核实后置状态（DESIGN §6.4）
       try {
         const verdict = await verifyExpects(page, step.expect, { vars: ctx.vars }, Math.min(timeout, 5000));
         if (verdict.ok) {
+          ctx.ledger.finished(step, ctx.actionRevision, 'verified', { url: page.url(), verifiedAfterTimeout: true });
           return { evidence: { url: page.url(), verifiedAfterTimeout: true } };
         }
       } catch {
@@ -209,6 +219,8 @@ export async function performAction(
     if (e instanceof ActionOutcomeUnknownError) throw e;
     const jev = e as { code?: string };
     if (jev?.code === 'POLICY_BLOCKED') throw e;
+    if (jev?.code === 'INVALID_INPUT') throw e; // 未派发，无需落账失败结果
+    ctx.ledger.finished(step, ctx.actionRevision, 'failed', { reason: (e as Error).message.slice(0, 200) });
     throw err('ACTION_FAILED', `动作 ${step.action} 失败: ${(e as Error).message.slice(0, 200)}`);
   }
 }

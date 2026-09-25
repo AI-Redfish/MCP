@@ -147,9 +147,13 @@ export class TaskStore {
     return r ? rowToTask(r) : undefined;
   }
 
-  /** 乐观 revision 转移：WHERE revision=? 保证取消/恢复/完成的原子性。 */
+  /**
+   * 乐观 revision 转移：WHERE revision=? 保证取消/恢复/完成的原子性。
+   * 合并语义：patch 中 undefined 的字段保留现值（null 表示清除）——
+   * 绝不能因部分更新把 cursor/vars/results 重置，否则恢复时会重放已执行动作。
+   */
   transition(taskId: string, expectedRevision: number, patch: {
-    status: string;
+    status?: string;
     pauseReason?: string | null;
     errorJson?: string | null;
     goalJson?: string | null;
@@ -158,15 +162,28 @@ export class TaskStore {
     resultsJson?: string;
     metricsJson?: string;
   }): number {
-    const res = this.db.prepare(
-      `UPDATE tasks SET status=?, pause_reason=?, error_json=?, goal_json=?, cursor=?, vars_json=?,
-        results_json=?, metrics_json=?, revision=revision+1, updated_at=? WHERE task_id=? AND revision=?`,
-    ).run(
-      patch.status, patch.pauseReason ?? null, patch.errorJson ?? null, patch.goalJson ?? null,
-      patch.cursor ?? 0, patch.varsJson ?? '{}', patch.resultsJson ?? '[]', patch.metricsJson ?? '{}',
-      Date.now(), taskId, expectedRevision,
-    );
-    return Number(res.changes);
+    return this.tx(() => {
+      const cur = this.getTask(taskId);
+      if (!cur || cur.revision !== expectedRevision) return 0;
+      const next = {
+        status: patch.status ?? cur.status,
+        pauseReason: patch.pauseReason !== undefined ? patch.pauseReason : cur.pauseReason,
+        errorJson: patch.errorJson !== undefined ? patch.errorJson : cur.errorJson,
+        goalJson: patch.goalJson !== undefined ? patch.goalJson : cur.goalJson,
+        cursor: patch.cursor ?? cur.cursor,
+        varsJson: patch.varsJson ?? cur.varsJson,
+        resultsJson: patch.resultsJson ?? cur.resultsJson,
+        metricsJson: patch.metricsJson ?? cur.metricsJson,
+      };
+      const res = this.db.prepare(
+        `UPDATE tasks SET status=?, pause_reason=?, error_json=?, goal_json=?, cursor=?, vars_json=?,
+          results_json=?, metrics_json=?, revision=revision+1, updated_at=? WHERE task_id=? AND revision=?`,
+      ).run(
+        next.status, next.pauseReason, next.errorJson, next.goalJson, next.cursor, next.varsJson,
+        next.resultsJson, next.metricsJson, Date.now(), taskId, expectedRevision,
+      );
+      return Number(res.changes);
+    });
   }
 
   listStale(statuses: string[]): TaskRow[] {
@@ -200,10 +217,8 @@ export class TaskStore {
     return r ? { bodyHash: r.body_hash, taskId: r.task_id } : undefined;
   }
 
-  putIdempotent(pkey: string, bodyHash: string, taskId: string, expectedHash?: string): void {
-    if (expectedHash !== undefined && expectedHash !== bodyHash) {
-      throw err('IDEMPOTENCY_CONFLICT', '相同 Idempotency-Key 但请求体不同');
-    }
+  /** 幂等记录与任务创建在同一事务内原子提交（DESIGN §8.3）。 */
+  putIdempotent(pkey: string, bodyHash: string, taskId: string): void {
     try {
       this.db.prepare('INSERT INTO idempotency (pkey, body_hash, task_id, created_at) VALUES (?, ?, ?, ?)').run(pkey, bodyHash, taskId, Date.now());
     } catch {
@@ -212,6 +227,12 @@ export class TaskStore {
         throw err('IDEMPOTENCY_CONFLICT', '相同 Idempotency-Key 但请求体不同');
       }
     }
+  }
+
+  /** 幂等记录拟保留 24h（DESIGN §9.1）；过期后不承诺去重。返回删除行数。 */
+  pruneIdempotency(olderThanMs: number, now = Date.now()): number {
+    const res = this.db.prepare('DELETE FROM idempotency WHERE created_at < ?').run(now - olderThanMs);
+    return Number(res.changes);
   }
 
   // ---- 审批 grant ----

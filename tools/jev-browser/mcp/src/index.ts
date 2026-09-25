@@ -23,7 +23,7 @@ import {
 } from '@ai-redfish/jev-browser-core';
 
 const PRINCIPAL = process.env.JEV_BROWSER_MCP_PRINCIPAL ?? 'mcp';
-const apiMode = process.env.JEV_BROWSER_API_URL && process.env.JEV_BROWSER_API_TOKEN;
+const apiMode = Boolean(process.env.JEV_BROWSER_API_URL && process.env.JEV_BROWSER_API_TOKEN);
 
 const api = apiMode
   ? new ApiClient({ baseUrl: process.env.JEV_BROWSER_API_URL!, token: process.env.JEV_BROWSER_API_TOKEN! })
@@ -35,7 +35,7 @@ async function rt(): Promise<Runtime> {
     const { config } = loadConfig();
     runtime = new Runtime(config);
     const recovery = runtime.recoverOnStartup();
-    console.error(`[jev-browser-mcp] 崩溃恢复: ${recovery.recovered} 个遗留任务转为暂停${recovery.isolated ? '（存在未知在途动作，已隔离）' : ''}`);
+    console.error(`[jev-browser-mcp] 崩溃恢复: ${recovery.recovered} 个遗留任务转为暂停，${recovery.expired} 个过期${recovery.isolated ? '；存在未知在途动作，已隔离' : ''}`);
   }
   return runtime;
 }
@@ -69,7 +69,7 @@ server.tool('browser_connect', TOOLS[1].description, {
   url: z.string().optional(),
   pageId: z.string().optional(),
   allowedOrigins: originSchema,
-  modelOrigins: z.array(z.string()).optional().describe('允许云模型外发的 origin；必须 ⊆ allowedOrigins'),
+  modelOrigins: z.array(z.string()).optional().describe('允许云模型外发的 origin；必须 ⊆ allowedOrigins；空 = 默认禁止外发'),
 }, async ({ url, pageId, allowedOrigins, modelOrigins }) => {
   try {
     const input = { target: url ? { kind: 'new', url } : { kind: 'existing', pageId }, allowedOrigins, modelOrigins: modelOrigins ?? [] };
@@ -98,13 +98,9 @@ server.tool('browser_select_page', TOOLS[3].description, { sessionId: z.string()
   }
 });
 
-server.tool('browser_snapshot', TOOLS[6].description, { sessionId: z.string(), forModel: z.boolean().optional() }, async ({ sessionId, forModel }) => {
+server.tool('browser_snapshot', TOOLS[6].description, { sessionId: z.string(), forModel: z.boolean().optional().describe('true = 打算发给云模型，要求 origin ∈ modelOrigins') }, async ({ sessionId, forModel }) => {
   try {
-    if (api) {
-      // API 模式下快照经 act/execute 之外的专用路径暂未开放：提示使用 embedded 或 API 扩展
-      return text({ hint: 'API 长驻模式暂不提供 snapshot 透传；请使用 embedded 模式或通过 execute 提取步骤' });
-    }
-    const obs = await (await rt()).snapshot(PRINCIPAL, sessionId, { forModel });
+    const obs = api ? await api.snapshot(sessionId, forModel) : await (await rt()).snapshot(PRINCIPAL, sessionId, { forModel });
     return text(obs);
   } catch (e) {
     return textErr(e);
@@ -114,14 +110,14 @@ server.tool('browser_snapshot', TOOLS[6].description, { sessionId: z.string(), f
 server.tool('browser_execute', TOOLS[4].description, {
   sessionId: z.string(),
   steps: z.array(z.record(z.unknown())).describe('FlowStep[]；导航/写操作需 expect 后置条件'),
-  values: z.record(z.unknown()).optional().describe('值字典；敏感值用 {"secretRef":"NAME"}'),
+  values: z.record(z.unknown()).optional().describe('值字典；敏感值用 {"secretRef":"NAME"}（环境 JEV_BROWSER_SECRET_<NAME>）'),
 }, async ({ sessionId, steps, values }) => {
   try {
     const input = { sessionId, steps, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> };
     const queued = api
       ? (await api.execute(input)) as unknown as TaskEnvelope
       : await (await rt()).execute(PRINCIPAL, sessionId, input as never);
-    const env = api ? await pollUntilPaused(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
+    const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -139,7 +135,7 @@ server.tool('browser_run', TOOLS[5].description, {
     const queued = api
       ? (await api.run(input)) as unknown as TaskEnvelope
       : await (await rt()).run(PRINCIPAL, sessionId, input as never);
-    const env = api ? await pollUntilPaused(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
+    const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -156,7 +152,7 @@ server.tool('browser_act', TOOLS[7].description, {
     const queued = api
       ? (await api.act(sessionId, input)) as unknown as TaskEnvelope
       : await (await rt()).act(PRINCIPAL, sessionId, { sessionId, step: step as never, values: (values ?? {}) as Record<string, import('@ai-redfish/jev-browser-core').ValueInput> });
-    const env = api ? await pollUntilPaused(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
+    const env = api ? await pollUntilSettled(api, queued.taskId) : await (await rt()).waitEnvelope(queued.taskId);
     return text(env);
   } catch (e) {
     return textErr(e);
@@ -189,7 +185,7 @@ server.tool('browser_task_resume', TOOLS[10].description, {
   taskId: z.string(),
   requestId: z.string(),
   expectedRevision: z.number().optional(),
-  rerunConfirmed: z.boolean().optional().describe('未知结果/歧义暂停后，人工确认允许重跑当前步骤'),
+  rerunConfirmed: z.boolean().optional().describe('未知结果/歧义/断连恢复暂停后，人工确认允许重跑当前步骤'),
 }, async ({ taskId, requestId, expectedRevision, rerunConfirmed }) => {
   try {
     const opts = { requestId, expectedRevision, rerunConfirmed };
@@ -212,6 +208,15 @@ server.tool('browser_task_approve', TOOLS[11].description, {
   }
 });
 
+server.tool('browser_artifact_get', TOOLS[12].description, { taskId: z.string() }, async ({ taskId }) => {
+  try {
+    const arts = api ? (await api.listArtifacts(taskId)).artifacts : (await rt()).listArtifacts(PRINCIPAL, taskId);
+    return text({ taskId, artifacts: arts });
+  } catch (e) {
+    return textErr(e);
+  }
+});
+
 server.tool('browser_disconnect', TOOLS[13].description, {
   sessionId: z.string(),
   detachTask: z.boolean().optional().describe('有暂停任务时，显式 detach 才允许断开'),
@@ -224,7 +229,7 @@ server.tool('browser_disconnect', TOOLS[13].description, {
   }
 });
 
-async function pollUntilPaused(client: ApiClient, taskId: string): Promise<TaskEnvelope> {
+async function pollUntilSettled(client: ApiClient, taskId: string): Promise<TaskEnvelope> {
   const deadline = Date.now() + 30 * 60_000;
   while (Date.now() < deadline) {
     const { envelope } = await client.getTask(taskId);
@@ -233,6 +238,18 @@ async function pollUntilPaused(client: ApiClient, taskId: string): Promise<TaskE
   }
   throw new Error('等待任务超时');
 }
+
+async function shutdown(signal: string): Promise<void> {
+  console.error(`[${SERVER_NAME}] 收到 ${signal}，收尾中…`);
+  try {
+    if (runtime) await runtime.close();
+  } catch {
+    /* 尽力而为 */
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
 server.connect(new StdioServerTransport()).then(() => {
   console.error(`[${SERVER_NAME}] MCP 服务已启动（stdio 传输；${apiMode ? 'API 转发模式' : '嵌入模式'}）`);

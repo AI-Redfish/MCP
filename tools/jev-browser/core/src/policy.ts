@@ -47,14 +47,20 @@ export interface PolicyInput {
   pageUrl: string;
   /** navigate 的目标 URL。 */
   navigateTo?: string;
+  /** 会话级授权域（宿主许可的子集，DESIGN §8.1）；提供时必须命中。 */
+  sessionAllowedOrigins?: string[];
 }
 
 export class PolicyGate {
   constructor(private readonly cfg: JevBrowserConfig) {}
 
   decide(input: PolicyInput): PolicyDecision {
-    const allowed = this.cfg.safety.allowedOrigins;
     const effectiveUrl = input.action === 'navigate' ? input.navigateTo ?? '' : input.pageUrl;
+    // 会话级 scope：任务不能扩大 session 创建时声明的权限（DESIGN §8.1）
+    if (input.sessionAllowedOrigins && !isOriginAllowed(effectiveUrl, input.sessionAllowedOrigins)) {
+      return { allow: false, code: 'ORIGIN_NOT_ALLOWED', reason: `origin 不在会话 allowedOrigins 内: ${originOf(effectiveUrl) || effectiveUrl}` };
+    }
+    const allowed = this.cfg.safety.allowedOrigins;
     if (allowed.length > 0 && !isOriginAllowed(effectiveUrl, allowed)) {
       return { allow: false, code: 'ORIGIN_NOT_ALLOWED', reason: `origin 未授权: ${originOf(effectiveUrl) || effectiveUrl}` };
     }

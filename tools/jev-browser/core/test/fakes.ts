@@ -2,6 +2,7 @@ import type {
   BrowserConnector, BrowserPort, ContextPort, DialogPort, DownloadPort, LocatorPort, PagePort,
 } from '../src/ports.js';
 import type { LocatorSpec } from '../src/types.js';
+import * as nodeFs from 'node:fs';
 
 /** 离线假件：不启动浏览器、不联网（P1 退出门槛：多数单测无浏览器/无 key）。 */
 
@@ -78,6 +79,10 @@ export class FakePage implements PagePort {
     return this.currentUrl;
   }
 
+  isClosed(): boolean {
+    return this.isClosedFlag;
+  }
+
   async title(): Promise<string> {
     return this.opts.title ?? 'Example';
   }
@@ -98,21 +103,21 @@ export class FakePage implements PagePort {
     });
   }
 
-  async evaluate(script: string): Promise<unknown> {
+  async evaluate<T = unknown>(script: string): Promise<T> {
     this.calls.push('evaluate');
-    if (script.includes('readyState')) return true;
+    if (script.includes('readyState')) return true as T;
     if (script.includes('.includes(')) {
       const m = script.match(/includes\((".*?")\)/);
       const needle = m ? JSON.parse(m[1]) as string : '';
-      return (this.opts.bodyText ?? '').includes(needle);
+      return (this.opts.bodyText ?? '').includes(needle) as T;
     }
     if (script.includes('querySelectorAll')) {
       return {
         elements: (this.opts.elements ?? []).map((e, i) => ({ i, role: e.role, name: e.name, tag: 'button', text: e.name })),
         truncated: false,
-      };
+      } as T;
     }
-    return null;
+    return null as T;
   }
 
   async keyboardPress(key: string): Promise<void> {
@@ -126,7 +131,7 @@ export class FakePage implements PagePort {
   async screenshot(opts?: { path?: string }): Promise<Buffer> {
     this.calls.push('screenshot');
     const buf = Buffer.from('png-bytes');
-    if (opts?.path) (require('node:fs') as typeof import('node:fs')).writeFileSync(opts.path, buf);
+    if (opts?.path) nodeFs.writeFileSync(opts.path, buf);
     return buf;
   }
 
@@ -139,7 +144,7 @@ export class FakePage implements PagePort {
     const dl = this.opts.downloadAfterClick;
     return {
       async saveAs(path: string): Promise<void> {
-        (require('node:fs') as typeof import('node:fs')).writeFileSync(path, dl?.content ?? 'data');
+        nodeFs.writeFileSync(path, dl?.content ?? 'data');
       },
       async failure(): Promise<string | null> {
         return null;
@@ -157,6 +162,11 @@ export class FakePage implements PagePort {
 
   markClosed(): void {
     this.isClosedFlag = true;
+  }
+
+  /** 测试辅助：模拟导航后的 URL 变化。 */
+  setUrl(url: string): void {
+    this.currentUrl = url;
   }
 }
 
@@ -198,5 +208,61 @@ export class FakeConnector implements BrowserConnector {
   async connect(): Promise<{ browser: BrowserPort; ownership: 'borrowed' | 'owned'; kind: 'attach' }> {
     this.lastConnect += 1;
     return { browser: this.browser, ownership: 'borrowed', kind: 'attach' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Jev 假件：脚本化决策（离线，不调用真实模型）
+// ---------------------------------------------------------------------------
+
+import type { JudgePort, RoundDecision, GoalAction } from '../src/judge.js';
+import type { PageObservation } from '../src/observe.js';
+
+export interface FakeJudgeScript {
+  /** 每轮 decideRound 依次出队；耗尽后用 fallback。 */
+  decisions: Array<Partial<RoundDecision>>;
+  fallback?: Partial<RoundDecision>;
+  /** check() 返回的概率。 */
+  checkP?: number;
+}
+
+export class FakeJudge implements JudgePort {
+  calls: Array<{ goal: string; elementCount: number }> = [];
+  checkCalls: Array<string> = [];
+  private stats = { jevRequests: 0, inputTokens: 0, outputTokens: 0 };
+
+  constructor(private readonly script: FakeJudgeScript) {}
+
+  available(): boolean {
+    return true;
+  }
+
+  usage() {
+    return { ...this.stats, jevRequests: this.stats.jevRequests };
+  }
+
+  async decideRound(input: { goal: string; observation: PageObservation }): Promise<RoundDecision> {
+    this.stats.jevRequests += 1;
+    this.stats.inputTokens += 100;
+    this.stats.outputTokens += 10;
+    this.calls.push({ goal: input.goal, elementCount: input.observation.elements.length });
+    const next = this.script.decisions.length > 0 ? this.script.decisions.shift()! : this.script.fallback ?? {};
+    return {
+      done: 0,
+      doneConfirm: 0,
+      blocked: 0,
+      error: 0,
+      action: 'none' as GoalAction,
+      targetIndex: null,
+      valueKey: null,
+      probabilities: {},
+      candidates: input.observation.elements,
+      ...next,
+    };
+  }
+
+  async check(_state: Record<string, unknown>, question: string): Promise<number> {
+    this.checkCalls.push(question);
+    return this.script.checkP ?? 0.9;
   }
 }

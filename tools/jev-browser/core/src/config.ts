@@ -176,7 +176,7 @@ function isPlainObject(v: unknown): v is Plain {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** 以 template 的键为准：未知键报错；数组与标量整体替换。 */
+/** 以 template 的键为准：未知键报错；标量类型必须与默认值一致；数组与对象递归。 */
 function mergeInto(target: Plain, patch: Plain, template: Plain, where: string): void {
   for (const [k, v] of Object.entries(patch)) {
     if (!(k in template)) {
@@ -187,6 +187,11 @@ function mergeInto(target: Plain, patch: Plain, template: Plain, where: string):
       mergeInto(target[k] as Plain, v, tv, `${where}.${k}`);
     } else if (isPlainObject(v) || Array.isArray(v) && isPlainObject(tv)) {
       throw err('CONFIG_INVALID', `${where}.${k}: 类型错误`);
+    } else if (Array.isArray(tv)) {
+      if (!Array.isArray(v)) throw err('CONFIG_INVALID', `${where}.${k}: 需要数组`);
+      target[k] = v;
+    } else if (typeof v !== typeof tv) {
+      throw err('CONFIG_INVALID', `${where}.${k}: 需要 ${typeof tv}，得到 ${typeof v}`);
     } else {
       target[k] = v;
     }
@@ -319,7 +324,7 @@ function validateFinal(cfg: JevBrowserConfig): void {
   if (cfg.safety.modelOrigins.some((o) => !cfg.safety.allowedOrigins.includes(o))) {
     throw err('CONFIG_INVALID', 'safety.modelOrigins 必须是 safety.allowedOrigins 的子集');
   }
-  const originRe = /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i;
+  const originRe = /^https?:\/\/[a-z0-9.-]+(?::\d+)?$/i;
   for (const o of [...cfg.safety.allowedOrigins, ...cfg.safety.modelOrigins]) {
     if (!originRe.test(o)) throw err('CONFIG_INVALID', `safety origin 非法（只允许明确的 http/https origin）: "${o}"`);
   }
@@ -329,6 +334,29 @@ function validateFinal(cfg: JevBrowserConfig): void {
   if (cfg.planner.enabled && (!cfg.planner.provider || !cfg.planner.baseUrl || !cfg.planner.model)) {
     throw err('CONFIG_INVALID', 'planner.enabled=true 时需要 provider/baseUrl/model（无默认厂商，DESIGN §7）');
   }
+  // 数值合理性：时限/预算必须为正（配置文件来源的字段在此兜底）
+  const positive: Array<[number, string]> = [
+    [cfg.browser.attach.timeoutMs, 'browser.attach.timeoutMs'],
+    [cfg.browser.launch.timeoutMs, 'browser.launch.timeoutMs'],
+    [cfg.jev.doneAt, 'jev.doneAt'],
+    [cfg.runtime.timeoutMs, 'runtime.timeoutMs'],
+    [cfg.runtime.maxSteps, 'runtime.maxSteps'],
+    [cfg.runtime.maxActions, 'runtime.maxActions'],
+    [cfg.runtime.maxJevRequests, 'runtime.maxJevRequests'],
+    [cfg.runtime.maxPlannerRequests, 'runtime.maxPlannerRequests'],
+    [cfg.runtime.queueTimeoutMs, 'runtime.queueTimeoutMs'],
+    [cfg.runtime.pauseTtlMs, 'runtime.pauseTtlMs'],
+    [cfg.runtime.taskTtlMs, 'runtime.taskTtlMs'],
+    [cfg.runtime.actionTimeoutMs, 'runtime.actionTimeoutMs'],
+    [cfg.safety.approvalTtlMs, 'safety.approvalTtlMs'],
+  ];
+  for (const [v, name] of positive) {
+    if (!Number.isFinite(v) || v <= 0) throw err('CONFIG_INVALID', `${name} 必须为正数: ${v}`);
+  }
+  for (const [v, name] of [[cfg.jev.doneAt, 'jev.doneAt'], [cfg.jev.confirmLow, 'jev.confirmLow'], [cfg.jev.confirmHigh, 'jev.confirmHigh']] as Array<[number, string]>) {
+    if (v < 0.5 || v > 1) throw err('CONFIG_INVALID', `${name} 应在 0.5..1 之间: ${v}`);
+  }
+  if (cfg.api.port < 1 || cfg.api.port > 65535) throw err('CONFIG_INVALID', `api.port 非法: ${cfg.api.port}`);
 }
 
 export interface LoadedConfig {
